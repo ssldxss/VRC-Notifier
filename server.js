@@ -429,10 +429,8 @@ class RateLimiter {
   }
 
   async checkLimit() {
-    return new Promise((resolve, reject) => {
-      this.waiting.push({ resolve, reject });
-      this.processQueue();
-    });
+    // 限流暂时禁用(ws 改造测试期):直接放行,不限制请求频率、不触发全局暂停
+    return true;
   }
 
   async processQueue() {
@@ -1622,17 +1620,7 @@ async function checkFriendStatus(user) {
     return;
   }
 
-  // 检查是否在冷却期内（登录或刷新后1分钟内不检查监控）
-  const loginTime = userLoginTime.get(user.vrchat_user_id);
-  const refreshTime = userRefreshTime.get(user.vrchat_user_id);
-  const lastActionTime = Math.max(loginTime || 0, refreshTime || 0);
-  
-  if (lastActionTime) {
-    const elapsed = Date.now() - lastActionTime;
-    if (elapsed < REFRESH_COOLDOWN) {
-      return;
-    }
-  }
+  // 冷却期已移除:ws 模式登录时基线对齐取代(checkFriendStatus 仍由 cron 调用,第7组删除)
 
   try {
     // 检查用户是否开启仅监控好友状态模式
@@ -1642,7 +1630,7 @@ async function checkFriendStatus(user) {
     const monitorConfigs = await new Promise((resolve, reject) => {
       const sql = statusOnlyMode 
         ? 'SELECT * FROM friend_monitor_config WHERE user_id = ? AND monitor_enabled = 1'
-        : 'SELECT * FROM friend_monitor_config WHERE user_id = ? AND monitor_enabled = 1 LIMIT 5';
+        : 'SELECT * FROM friend_monitor_config WHERE user_id = ? AND monitor_enabled = 1';
       db.all(
         sql,
         [user.id],
@@ -2963,8 +2951,8 @@ async function runMonitorTask() {
   }
 }
 
-// 每30秒检查一次（符合API限制：≤2次/分钟，保守设置）
-cron.schedule('*/30 * * * * *', runMonitorTask);
+// 7.1 cron 轮询已移除:改用 ws 事件驱动(见 ws pipeline 集成)。
+// runMonitorTask/checkFriendStatus 保留为死代码,不再被调用;其内部防抖/worldPollIndex/worldChangeBuffer 不执行。
 
 // ==================== API 路由 ====================
 
@@ -3187,7 +3175,18 @@ app.post('/api/auto-login', async (req, res) => {
       
       // 记录登录时间
       userLoginTime.set(user.id, Date.now());
-      
+
+      // 6.3 + 6.5 自动登录后:写基线 + 连 ws
+      try {
+        await fetchAndCacheFriends(api, user.id, false, true);
+        const dbUser = await getUserByVrcId(user.id);
+        if (dbUser && dbUser.monitor_enabled !== 0) {
+          pipelineManager.connectPipeline(user.id, user.displayName);
+        }
+      } catch (e) {
+        console.error(`[自动登录] 启动 ws 失败:`, e.message);
+      }
+
       return res.json({
         code: 0,
         msg: '自动登录成功',
@@ -3288,9 +3287,12 @@ app.get('/api/me', async (req, res) => {
 // 3. 获取好友列表（只请求一次API获取所有好友）
 // 获取好友列表并更新缓存（同时获取在线和离线好友）
 // fetchWorldInfo: 是否获取世界信息（登录时不获取，避免API限流）
-async function fetchAndCacheFriends(session, userId, fetchWorldInfo = false) {
+async function fetchAndCacheFriends(session, userId, fetchWorldInfo = false, upsertBaseline = false) {
   try {
     console.log(`[好友列表] 开始获取用户 ${userId} 的好友列表（在线+离线）${fetchWorldInfo ? '包含世界信息' : '不包含世界信息'}`);
+    // 5.1 基线对齐:查 DB user id,循环里顺便 upsert friends 表基线(静默,不通知)
+    const dbUser = upsertBaseline ? await getUserByVrcId(userId) : null;
+    const dbUserId = dbUser ? dbUser.id : null;
     
     // 同时请求在线和离线好友（2个API请求）
     const onlineCacheKey = `friends_online_${userId}`;
@@ -3380,6 +3382,20 @@ async function fetchAndCacheFriends(session, userId, fetchWorldInfo = false) {
         isOnline: friend.isOnline !== false,
         platform: friend.platform || 'unknown'
       });
+      // 5.1 基线对齐:upsert friends 表(静默,不通知)
+      if (upsertBaseline && dbUserId) {
+        await upsertFriend(dbUserId, friend.id, {
+          state: friend.state || (location === 'offline' ? 'offline' : 'online'),
+          status: friend.status || 'offline',
+          location,
+          worldId,
+          worldName,
+          platform: friend.platform || 'unknown',
+          statusDescription: friend.statusDescription || null,
+          displayName: friend.displayName,
+          avatarUrl
+        });
+      }
     }
 
     // 更新缓存（标记为永久缓存）
@@ -3456,9 +3472,19 @@ app.post('/api/friends/initial-refresh', async (req, res) => {
     console.log(`[首次刷新] 用户 ${userId} 登录后自动刷新好友列表（不获取世界信息）`);
     
     // 强制刷新，忽略缓存，不获取世界信息（避免登录时API限流）
-    const friends = await fetchAndCacheFriends(session, userId, false);
+    // 5.1 upsertBaseline=true:登录后写 friends 表基线(静默)
+    const friends = await fetchAndCacheFriends(session, userId, false, true);
     
     if (friends) {
+      // 6.2 + 6.5 登录/首次刷新后连 ws(基线已写)
+      try {
+        const dbUser = await getUserByVrcId(userId);
+        if (dbUser && dbUser.monitor_enabled !== 0) {
+          pipelineManager.connectPipeline(userId, dbUser.display_name);
+        }
+      } catch (e) {
+        console.error(`[首次刷新] 启动 ws 失败:`, e.message);
+      }
       return res.json({ code: 0, data: { friends: friends, fromCache: false, refreshed: true } });
     } else {
       return res.json({ code: -1, msg: '刷新好友列表失败，请稍后重试' });
@@ -3482,30 +3508,9 @@ app.post('/api/friends/refresh', async (req, res) => {
       return res.json({ code: -1, msg: '未登录或会话已过期' });
     }
 
-    // 检查是否在冷却期内（登录或刷新后1分钟）
-    const loginTime = userLoginTime.get(userId);
-    const lastRefreshTime = userRefreshTime.get(userId);
-    const lastActionTime = Math.max(loginTime || 0, lastRefreshTime || 0);
-    
-    if (lastActionTime) {
-      const elapsed = Date.now() - lastActionTime;
-      if (elapsed < REFRESH_COOLDOWN) {
-        const remaining = Math.ceil((REFRESH_COOLDOWN - elapsed) / 1000);
-        console.log(`[手动刷新] 用户 ${userId} 在冷却期内，剩余 ${remaining} 秒`);
-        return res.json({ 
-          code: -1, 
-          msg: `请等待 ${remaining} 秒后再刷新`,
-          cooldown: true,
-          remaining: remaining
-        });
-      }
-    }
-
-    // 记录刷新时间，这将导致监控暂停60秒
-    userRefreshTime.set(userId, Date.now());
-
+    // 冷却期已移除:刷新时 fetchAndCacheFriends 自动对齐 friends 表基线(5.1)
     // 强制刷新，忽略缓存，不获取世界信息（避免触发API限流）
-    const friends = await fetchAndCacheFriends(session, userId, false);
+    const friends = await fetchAndCacheFriends(session, userId, false, true);
     
     if (friends) {
       return res.json({ code: 0, data: { friends: friends, fromCache: false, refreshed: true, cooldownStarted: true } });
@@ -3746,6 +3751,8 @@ app.post('/api/logout', async (req, res) => {
         }
       }
       
+      // 6.4 断开 ws
+      pipelineManager.disconnectPipeline(userId);
       // 从会话缓存中删除
       userSessions.delete(userId);
       console.log(`用户 ${userId} 已登出，服务器端会话已完全清除`);
@@ -3796,6 +3803,8 @@ app.post('/api/logout-and-clear', async (req, res) => {
           console.error('清除 cookie 失败:', e.message);
         }
       }
+      // 6.4 断开 ws
+      pipelineManager.disconnectPipeline(userId);
       userSessions.delete(userId);
     }
 
@@ -4853,6 +4862,266 @@ app.get('/api/rate-limit-status', (req, res) => {
   });
 });
 
+// ==================== ws pipeline 集成 ====================
+// 实时好友事件采集:ws 事件 -> 入库 + 通知筛选(采集与通知解耦,对照 design D3/D14)
+const { createPipelineManager } = require('./ws-pipeline');
+
+async function getUserByVrcId(vrchatUserId) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT * FROM users WHERE vrchat_user_id = ?', [vrchatUserId], (err, row) => {
+      if (err) reject(err); else resolve(row);
+    });
+  });
+}
+
+async function getFriendFromDB(dbUserId, friendVrcId) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT * FROM friends WHERE user_id = ? AND friend_vrchat_id = ?', [dbUserId, friendVrcId], (err, row) => {
+      if (err) reject(err); else resolve(row);
+    });
+  });
+}
+
+// 通知偏好白名单(第4组:采集不查,通知时才查)
+async function getMonitorConfig(dbUserId, friendVrcId) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT * FROM friend_monitor_config WHERE user_id = ? AND friend_vrchat_id = ? AND monitor_enabled = 1', [dbUserId, friendVrcId], (err, row) => {
+      if (err) reject(err); else resolve(row);
+    });
+  });
+}
+
+// 3.4 + 3.5 friends 表 upsert:无记录 INSERT 静默初始化(不通知),有记录 UPDATE
+async function upsertFriend(dbUserId, friendVrcId, state) {
+  const existing = await getFriendFromDB(dbUserId, friendVrcId);
+  const now = new Date().toISOString();
+  if (!existing) {
+    await new Promise((resolve, reject) => {
+      db.run(
+        `INSERT INTO friends (user_id, friend_vrchat_id, display_name, avatar_url, status, state, world_id, world_name, status_description, platform, last_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [dbUserId, friendVrcId, state.displayName, state.avatarUrl, state.status || 'offline', state.state || 'offline', state.worldId, state.worldName, state.statusDescription, state.platform || 'unknown', now],
+        (err) => { if (err) reject(err); else resolve(); }
+      );
+    });
+    console.log(`[ws] 首次静默初始化好友 ${state.displayName || friendVrcId}`);
+    return { isNew: true };
+  }
+  await new Promise((resolve, reject) => {
+    db.run(
+      `UPDATE friends SET display_name = ?, avatar_url = ?, status = ?, state = ?, world_id = ?, world_name = ?, status_description = ?, platform = ?, last_seen = ? WHERE id = ?`,
+      [state.displayName ?? existing.display_name, state.avatarUrl ?? existing.avatar_url, state.status ?? existing.status, state.state ?? existing.state, state.worldId ?? existing.world_id, state.worldName ?? existing.world_name, state.statusDescription ?? existing.status_description, state.platform ?? existing.platform, now, existing.id],
+      (err) => { if (err) reject(err); else resolve(); }
+    );
+  });
+  return { isNew: false, existing };
+}
+
+// 3.6 friend-location 事件触发查 /worlds/{id}(走 worldInfo 缓存)
+async function fetchWorldName(session, worldId, userId) {
+  if (!worldId || !worldId.startsWith('wrld_')) return null;
+  const worldCacheKey = `world_${worldId}_${userId}`;
+  try {
+    const worldRes = await cachedApiRequest(session.api, `/worlds/${worldId}`, 'worldInfo', worldCacheKey, userId);
+    if (worldRes.status === 200) return worldRes.data.name;
+  } catch (e) {
+    console.error(`[ws] 获取世界 ${worldId} 失败:`, e.message);
+  }
+  return null;
+}
+
+// 4 渠道通知(复用现有函数,默认智能模板)
+async function sendFriendNotification(user, friend, params) {
+  const { oldStatus, newStatus, oldWorld, newWorld, changeType, oldStatusDescription, newStatusDescription, oldPlatform, newPlatform } = params;
+  await sendEmailNotification(user, { friend, oldStatus, newStatus, oldWorld, newWorld, changeType, oldStatusDescription, newStatusDescription, oldPlatform, newPlatform });
+  const timestamp = new Date().toLocaleString('zh-CN');
+  const gotifyTitle = generateGotifyTitle(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld);
+  const gotifyMessage = generateGotifyMessage(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld, timestamp, oldStatusDescription, newStatusDescription);
+  const extras = { 'client::display': { 'contentType': 'text/markdown' } };
+  await sendGotifyNotification(user, gotifyTitle, gotifyMessage, user.gotify_priority || 5, extras);
+  if (user.ntfy_enabled) {
+    const ntfyTimestamp = formatDateSafe(new Date());
+    const ntfyTitle = generateGotifyTitle(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld);
+    const ntfyMessage = generateGotifyMessage(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld, ntfyTimestamp, oldStatusDescription, newStatusDescription);
+    await sendNtfyNotification(user, ntfyTitle, ntfyMessage, user.ntfy_priority || 3, null);
+  }
+  const eventType = oldStatus === 'offline' ? 'friend_online' : (newStatus === 'offline' ? 'friend_offline' : 'status_change');
+  await sendWebhookNotification(user, {
+    friendName: friend.display_name, oldStatus, newStatus, oldWorld, newWorld, changeType,
+    oldStatusDescription, newStatusDescription, timestamp, avatarUrl: friend.avatar_url, eventType,
+    oldPlatform: oldPlatform || 'unknown', newPlatform: newPlatform || 'unknown',
+    oldPlatformDisplay: getPlatformDisplayName(oldPlatform || 'unknown'), newPlatformDisplay: getPlatformDisplayName(newPlatform || 'unknown')
+  });
+}
+
+// 3.3 applyFriendChange:state 变化(上线/下线/web端),对照 design D14
+async function applyFriendChange(user, friendId, newState) {
+  const upsertResult = await upsertFriend(user.id, friendId, newState);
+  if (upsertResult.isNew) return; // 3.5 首次静默,不通知
+
+  const existing = upsertResult.existing;
+  const oldStateStr = existing.state || (existing.status === 'offline' ? 'offline' : 'online');
+  const newStateStr = newState.state;
+
+  // 分类(基于 state 转换)
+  let changeType = null;
+  let notifyField = null;
+  if (oldStateStr === 'offline' && newStateStr === 'online') { changeType = '上线'; notifyField = 'notify_online'; }
+  else if (oldStateStr === 'online' && newStateStr === 'offline') { changeType = '下线'; notifyField = 'notify_offline'; }
+  else if (oldStateStr === 'active' && newStateStr === 'online') { changeType = 'web端上线'; notifyField = 'notify_online'; }
+  else if (oldStateStr === 'online' && newStateStr === 'active') { changeType = '下线至web端'; notifyField = 'notify_offline'; }
+  else if (oldStateStr === 'offline' && newStateStr === 'active') { changeType = 'web端上线'; notifyField = 'notify_online'; }
+  // active -> offline:网页下线,不通知(沿用原行为)
+  if (!changeType) return;
+
+  // 4.1 通知筛选:查 friend_monitor_config 白名单 + notify_* 偏好
+  const config = await getMonitorConfig(user.id, friendId);
+  if (!config) return; // 不在白名单,仅入库不通知
+  if (!config[notifyField]) return; // 对应通知偏好关
+
+  const oldStatus = existing.status;
+  const newStatus = newState.status || existing.status;
+  const oldWorld = existing.world_name;
+  const newWorld = newState.worldName ?? existing.world_name;
+  await sendFriendNotification(user, existing, {
+    oldStatus, newStatus, oldWorld, newWorld, changeType,
+    oldStatusDescription: existing.status_description, newStatusDescription: newState.statusDescription,
+    oldPlatform: existing.platform, newPlatform: newState.platform
+  });
+  console.log(`[ws] 好友 ${existing.display_name} ${changeType},已发通知`);
+}
+
+// friend-update 事件:status(社交状态)/ statusDescription / 资料变
+async function handleFriendUpdate(user, content) {
+  const u = content.user;
+  if (!u || !u.id) return;
+  const dbFriend = await getFriendFromDB(user.id, u.id);
+  if (!dbFriend) {
+    await upsertFriend(user.id, u.id, { displayName: u.displayName, avatarUrl: u.currentAvatarImageUrl, status: u.status, statusDescription: u.statusDescription });
+    return; // 首次静默
+  }
+  const oldStatus = dbFriend.status;
+  const newStatus = u.status || oldStatus;
+  const oldDesc = dbFriend.status_description;
+  const newDesc = u.statusDescription ?? oldDesc;
+  await new Promise((resolve, reject) => {
+    db.run('UPDATE friends SET display_name = ?, avatar_url = ?, status = ?, status_description = ? WHERE id = ?',
+      [u.displayName || dbFriend.display_name, u.currentAvatarImageUrl || dbFriend.avatar_url, newStatus, newDesc, dbFriend.id],
+      (err) => { if (err) reject(err); else resolve(); });
+  });
+  // status 变化(游戏在线状态间切换 active/join me/ask me/busy)
+  if (oldStatus !== newStatus && ['active', 'join me', 'ask me', 'busy'].includes(oldStatus) && ['active', 'join me', 'ask me', 'busy'].includes(newStatus)) {
+    const config = await getMonitorConfig(user.id, u.id);
+    if (config && config.notify_status_change) {
+      await sendFriendNotification(user, dbFriend, { oldStatus, newStatus, oldWorld: dbFriend.world_name, newWorld: dbFriend.world_name, changeType: '状态变化', oldStatusDescription: oldDesc, newStatusDescription: newDesc, oldPlatform: dbFriend.platform, newPlatform: dbFriend.platform });
+    }
+  } else if (oldDesc !== newDesc && newStatus !== 'offline') {
+    // 自定义状态变化
+    const config = await getMonitorConfig(user.id, u.id);
+    if (config) {
+      await sendFriendNotification(user, dbFriend, { oldStatus, newStatus, oldWorld: dbFriend.world_name, newWorld: dbFriend.world_name, changeType: '自定义状态', oldStatusDescription: oldDesc, newStatusDescription: newDesc, oldPlatform: dbFriend.platform, newPlatform: dbFriend.platform });
+    }
+  }
+}
+
+// friend-location 事件:世界变(3.6)
+async function handleFriendLocation(user, content) {
+  const session = userSessions.get(user.vrchat_user_id);
+  const newWorldName = session ? await fetchWorldName(session, content.worldId, user.vrchat_user_id) : null;
+  const dbFriend = await getFriendFromDB(user.id, content.userId);
+  if (!dbFriend) {
+    await upsertFriend(user.id, content.userId, { state: 'online', location: content.location, worldId: content.worldId, worldName: newWorldName, platform: content.platform, displayName: content.user?.displayName, status: content.user?.status, statusDescription: content.user?.statusDescription });
+    return; // 首次静默
+  }
+  const oldWorld = dbFriend.world_name;
+  await upsertFriend(user.id, content.userId, { state: 'online', location: content.location, worldId: content.worldId, worldName: newWorldName, platform: content.platform, displayName: content.user?.displayName, status: dbFriend.status, statusDescription: dbFriend.status_description });
+  // 4.2 世界变化通知(status_only_mode=1 时跳过)
+  if (oldWorld !== newWorldName && newWorldName && ['active', 'join me'].includes(dbFriend.status) && user.status_only_mode !== 1) {
+    const config = await getMonitorConfig(user.id, content.userId);
+    if (config && config.notify_world_change) {
+      await sendFriendNotification(user, dbFriend, { oldStatus: dbFriend.status, newStatus: dbFriend.status, oldWorld, newWorld: newWorldName, changeType: '切换世界', oldStatusDescription: dbFriend.status_description, newStatusDescription: dbFriend.status_description, oldPlatform: dbFriend.platform, newPlatform: dbFriend.platform });
+    }
+  }
+}
+
+// 3.2 onMessage 回调:ws 事件 -> changeType 映射(对照 design D14)
+async function handlePipelineEvent(userId, raw, parsed) {
+  const { type, content } = parsed;
+  if (!content) return;
+  const user = await getUserByVrcId(userId);
+  if (!user || user.monitor_enabled === 0) return; // 6.5 用户级监控关
+  try {
+    switch (type) {
+      case 'friend-online':
+        await applyFriendChange(user, content.userId, {
+          state: 'online', status: content.user?.status, location: content.location, worldId: content.worldId,
+          platform: content.platform, statusDescription: content.user?.statusDescription,
+          displayName: content.user?.displayName, avatarUrl: content.user?.currentAvatarImageUrl
+        });
+        break;
+      case 'friend-active':
+        await applyFriendChange(user, content.userId, {
+          state: 'active', status: content.user?.status || 'active', location: 'offline', worldId: null,
+          platform: content.platform || 'web', statusDescription: content.user?.statusDescription,
+          displayName: content.user?.displayName, avatarUrl: content.user?.currentAvatarImageUrl
+        });
+        break;
+      case 'friend-offline':
+        await applyFriendChange(user, content.userId, {
+          state: 'offline', status: 'offline', location: 'offline', worldId: null,
+          platform: content.platform, statusDescription: null
+        });
+        break;
+      case 'friend-location':
+        await handleFriendLocation(user, content);
+        break;
+      case 'friend-update':
+        await handleFriendUpdate(user, content);
+        break;
+      default:
+        break; // 忽略 friend-add/delete 等其他事件(可选增强)
+    }
+  } catch (e) {
+    console.error(`[ws] handlePipelineEvent 错误 type=${type}:`, e.message);
+  }
+}
+
+// 创建 pipeline 管理器(依赖注入,避免循环依赖)
+const pipelineManager = createPipelineManager({
+  getSession: (userId) => userSessions.get(userId),
+  deleteSession: (userId) => userSessions.delete(userId),
+  onGameLogin: (userId, displayName) => sendGameLoginEvent(userId, displayName),
+  onMessage: handlePipelineEvent,
+  userAgent: USER_AGENT,
+  log: (msg) => console.log(msg)
+});
+
+// 6.6 服务启动恢复 remember_me=1 用户的 ws 监控
+async function restoreAllPipelineConnections() {
+  const users = await new Promise((resolve, reject) => {
+    db.all('SELECT * FROM users WHERE remember_me = 1', [], (err, rows) => {
+      if (err) reject(err); else resolve(rows || []);
+    });
+  });
+  for (const user of users) {
+    try {
+      const cookieJar = await loadUserCookies(user.vrchat_user_id);
+      if (!cookieJar) continue;
+      const api = createAxiosInstance(cookieJar);
+      const userRes = await api.get('/auth/user');
+      if (userRes.status !== 200) continue;
+      userSessions.set(user.vrchat_user_id, { cookieJar, api, createdAt: Date.now() });
+      await fetchAndCacheFriends(api, user.vrchat_user_id, false, true); // 写基线
+      if (user.monitor_enabled !== 0) { // 6.5
+        pipelineManager.connectPipeline(user.vrchat_user_id, user.display_name);
+      }
+      console.log(`[ws] 恢复用户 ${user.display_name} 的 ws 监控`);
+    } catch (e) {
+      console.error(`[ws] 恢复用户 ${user.vrchat_user_id} 失败:`, e.message);
+    }
+  }
+}
+
 // 启动服务器
 async function startServer() {
   // 初始化访问密钥
@@ -4865,11 +5134,14 @@ async function startServer() {
     console.log('访问地址: http://localhost:' + PORT);
     console.log('访问密钥: ' + (enabled ? '已启用 (' + accessKey + ')' : '已禁用'));
     console.log('邮件通知: 已启用');
-    console.log('检查间隔: 每30秒（符合API限制：<=2次/分钟，保守设置）');
-    console.log('API限流保护: 已启用（触发后自动暂停60秒）');
+    console.log('监控模式: WebSocket 实时事件驱动(cron 轮询已停用)');
+    console.log('API限流保护: 已启用(对账路用,ws 事件驱动不限流)');
     console.log('作者官网: https://shany.cc/');
     console.log('================================================');
   });
+
+  // 6.6 服务启动:恢复 remember_me=1 用户的 ws 监控
+  restoreAllPipelineConnections().catch(e => console.error('[ws] 恢复失败:', e.message));
 }
 
 startServer();

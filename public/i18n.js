@@ -100,7 +100,7 @@ const i18n = {
       'friends.refresh.cooldown': '冷却中：',
       'friends.refresh.cooldown.suffix': '秒后可用',
       'friends.refresh.success': '刷新成功！',
-      'friends.monitor.limit': '最多监控5个好友，仅监控好友会刷新状态',
+      'friends.monitor.limit': '监控数量不限，所有好友变化实时入库',
       'friends.about': '关于',
       'friends.view.toggle': '切换视图',
 

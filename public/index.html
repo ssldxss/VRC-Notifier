@@ -1340,7 +1340,7 @@
               <span data-i18n="friends.refresh">刷新</span>
             </button>
             <span class="refresh-hint" data-i18n="friends.refresh.hint">请勿频繁点击</span>
-            <span id="monitorLimitText" style="color: var(--text-secondary); font-size: 0.85rem; margin-left: 12px;" data-i18n="friends.monitor.limit">最多监控5个好友，仅监控好友会刷新状态</span>
+            <span id="monitorLimitText" style="color: var(--text-secondary); font-size: 0.85rem; margin-left: 12px;" data-i18n="friends.monitor.limit">监控数量不限，所有好友变化实时入库</span>
           </div>
           <div class="friends-controls-right">
             <button id="aboutBtn" class="view-toggle-icon" title="关于" data-i18n-title="friends.about">?</button>
@@ -3487,16 +3487,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           const enabled = e.target.checked;
           const card = friendsList.querySelector(`.${cardClass}[data-friend-id="${friendId}"]`);
           
-          // 检查是否超过5个监控限制（仅状态模式下无限制）
-          if (enabled && !currentStatusOnlyMode) {
-            const monitoredCount = Object.values(friendMonitorConfigs).filter(c => c.monitorEnabled).length;
-            if (monitoredCount >= 5) {
-              e.target.checked = false;
-              alert(i18n.t('friend.monitor.max'));
-              return;
-            }
-          }
-
+          // 8.1 5个监控限制已取消(ws 模式不限数量)
           if (await updateFriendMonitor(friendId, enabled)) {
             if (enabled) {
               card.classList.add('monitoring');
