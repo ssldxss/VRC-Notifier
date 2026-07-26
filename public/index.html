@@ -3979,6 +3979,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 加载访问密钥设置
     async function loadAccessKeySettings() {
+      // 访问密钥已去掉(后端删了端点):不加载
+      return;
       try {
         const res = await fetch(`${API_BASE}/access-key-status`);
         const data = await res.json();

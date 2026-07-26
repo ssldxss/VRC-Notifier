@@ -2,7 +2,7 @@
 // 把"本工具 <-> VRChat"的实时通道从 REST 轮询改成 ws 事件驱动。
 // 认证:用现有登录后的 auth cookie 调 GET /auth 换 pipeline token,token 放 ws URL(?auth=),握手不带 cookie。
 // 保活:协议级 Ping/Pong 10s,无应用层心跳(VRChat pipeline 沉默是常态)。
-// 重连:断线 5s 重新换 token 重连,不重新登录;换 token 失败(401)判定 session 失效,触发游戏登录检测,不重连。
+// 重连:断线 5s 重新换 token 重连,不重新登录;换 token 失败一律 5s 重试,不判 session 失效(默认 cookies 不失效)。
 // 去重:与上一帧原始字符串比对,相同丢弃(照搬 VRCX lastWebSocketMessage)。
 // 参考:vrcx-web/spike/Spike.cs + vrcx/src/services/websocket.js
 const WebSocket = require('ws');
