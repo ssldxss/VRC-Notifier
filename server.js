@@ -8,7 +8,6 @@ const nodemailer = require('nodemailer');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 5270;
@@ -319,39 +318,6 @@ db.serialize(() => {
   )`);
 });
 
-// 初始化访问密钥
-async function initAccessKey() {
-  const accessKey = await new Promise((resolve, reject) => {
-    db.get('SELECT value FROM system_settings WHERE key = ?', ['access_key'], (err, row) => {
-      if (err) reject(err);
-      else resolve(row ? row.value : null);
-    });
-  });
-
-  if (!accessKey) {
-    // 生成32位随机密钥
-    const newKey = crypto.randomBytes(32).toString('hex').toUpperCase();
-    await new Promise((resolve, reject) => {
-      db.run('INSERT INTO system_settings (key, value) VALUES (?, ?)', ['access_key', newKey], (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    return newKey;
-  }
-  return accessKey;
-}
-
-// 获取访问密钥启用状态
-async function isAccessKeyEnabled() {
-  const result = await new Promise((resolve, reject) => {
-    db.get('SELECT value FROM system_settings WHERE key = ?', ['access_key_enabled'], (err, row) => {
-      if (err) reject(err);
-      else resolve(row ? row.value : '1'); // 默认启用
-    });
-  });
-  return result === '1';
-}
 
 // 用户会话缓存
 const userSessions = new Map();
@@ -400,7 +366,6 @@ const CACHE_TTL = {
 };
 
 // 世界信息轮询索引 - 按用户隔离
-const worldPollIndex = new Map();  // Map<userId, {currentIndex: number, lastPollTime: number}>
 
 // 好友列表缓存 - 按用户隔离，实现秒开效果
 const friendsListCache = new Map();  // Map<userId, {friends: [], timestamp: number, permanent: boolean}>
@@ -412,7 +377,6 @@ const userRefreshTime = new Map();  // Map<userId, lastRefreshTimestamp>
 const REFRESH_COOLDOWN = 60 * 1000;  // 登录或刷新后1分钟冷却期（1分钟内不检查监控）
 
 // 世界变化缓存 - 用于批量发送世界变化通知
-const worldChangeBuffer = new Map();  // Map<userId, {changes: [], lastPollRound: number}>
 
 // 请求队列（用于控制并发）- 按用户ID隔离
 const requestQueues = new Map();  // Map<userId, Map<type, RateLimiter>>
@@ -617,43 +581,6 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000); // 每5分钟清理一次
 
-// 加密配置
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
-const ENCRYPTION_IV_LENGTH = 16;
-
-// 加密函数
-function encrypt(text) {
-  if (!text) return null;
-  try {
-    const iv = crypto.randomBytes(ENCRYPTION_IV_LENGTH);
-    const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
-    let encrypted = cipher.update(text, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    return iv.toString('hex') + ':' + encrypted;
-  } catch (e) {
-    console.error('加密失败:', e.message);
-    return null;
-  }
-}
-
-// 解密函数
-function decrypt(encryptedText) {
-  if (!encryptedText) return null;
-  try {
-    const parts = encryptedText.split(':');
-    if (parts.length !== 2) return null;
-    const iv = Buffer.from(parts[0], 'hex');
-    const encrypted = parts[1];
-    const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
-    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
-  } catch (e) {
-    console.error('解密失败:', e.message);
-    return null;
-  }
-}
-
 // 格式化本地时间（用于日志显示）
 function formatLocalTime(date = new Date()) {
   return date.toLocaleString('zh-CN', {
@@ -695,6 +622,22 @@ function createAxiosInstance(cookieJar) {
   });
   
   axiosCookieJarSupport(instance);
+  // 拦截器:日志所有 API 请求/响应(带时间戳 + status + body 原文片段)
+  instance.interceptors.request.use((config) => {
+    console.log(`[${new Date().toISOString()}] [API请求] ${(config.method || 'get').toUpperCase()} ${config.baseURL || ''}${config.url}`);
+    return config;
+  });
+  instance.interceptors.response.use((response) => {
+    console.log(`[${new Date().toISOString()}] [API响应] ${response.config.url} status=${response.status} body=${JSON.stringify(response.data).slice(0, 300)}`);
+    return response;
+  }, (error) => {
+    if (error.response) {
+      console.log(`[${new Date().toISOString()}] [API响应错误] ${error.response.config?.url} status=${error.response.status} body=${JSON.stringify(error.response.data).slice(0, 300)}`);
+    } else {
+      console.log(`[${new Date().toISOString()}] [API网络错误] ${error.message}`);
+    }
+    return Promise.reject(error);
+  });
   return instance;
 }
 
@@ -712,7 +655,7 @@ async function saveUserCookies(userId, cookieJar, username = null) {
     const cookieData = JSON.stringify(cookies.map(c => c.toJSON()));
     
     // 加密存储
-    const encryptedCookieData = encrypt(cookieData);
+    const encryptedCookieData = cookieData;
     
     // 保存到数据库（同时保存 cookie 和用户名）
     const updates = ['cookie_data = ?', 'remember_me = 1', 'updated_at = CURRENT_TIMESTAMP'];
@@ -765,7 +708,7 @@ async function loadUserCookies(userId) {
     }
     
     // 解密 cookie 数据
-    const decryptedCookieData = decrypt(user.cookie_data);
+    const decryptedCookieData = user.cookie_data;
     if (!decryptedCookieData) {
       console.error(`[记住我] 解密用户 ${userId} 的 cookies 失败`);
       return null;
@@ -1241,7 +1184,7 @@ async function sendEmailNotification(user, params) {
   }
 
   // 解密 SMTP 密码
-  const decryptedPass = decrypt(user.smtp_pass);
+  const decryptedPass = user.smtp_pass;
   if (!decryptedPass) {
     console.error(`用户 ${user.display_name} 的 SMTP 密码解密失败`);
     return false;
@@ -1377,168 +1320,6 @@ async function sendEmailNotification(user, params) {
 }
 
 // 批量发送邮件通知
-async function sendBatchEmailNotification(user, statusChanges) {
-  if (!user.smtp_host || !user.smtp_user || !user.smtp_pass) {
-    console.log(`用户 ${user.display_name} 未配置 SMTP，跳过邮件通知`);
-    return false;
-  }
-
-  // 解密 SMTP 密码
-  const decryptedPass = decrypt(user.smtp_pass);
-  if (!decryptedPass) {
-    console.error(`用户 ${user.display_name} 的 SMTP 密码解密失败`);
-    return false;
-  }
-
-  const transporter = nodemailer.createTransport({
-    host: user.smtp_host,
-    port: user.smtp_port || 587,
-    secure: user.smtp_secure === 1,
-    auth: {
-      user: user.smtp_user,
-      pass: decryptedPass
-    }
-  });
-
-  const timestamp = new Date().toLocaleString('zh-CN');
-  
-  // 构建批量变化详情HTML
-  let changesHtml = statusChanges.map((change, index) => {
-    const { friend, oldStatus, newStatus, oldWorld, newWorld, changeType } = change;
-    
-    let details = [];
-    if (oldStatus !== newStatus) {
-      details.push(`状态: ${oldStatus} → ${newStatus}`);
-    }
-    if (oldWorld !== newWorld && newWorld) {
-      details.push(`世界: ${oldWorld || '-'} → ${newWorld}`);
-    }
-    
-    return `
-      <tr>
-        <td style="padding: 15px; border-bottom: 1px solid #e5e7eb; vertical-align: top;">
-          <div style="display: flex; align-items: center; gap: 12px;">
-            <img src="${friend.avatar_url || 'https://via.placeholder.com/48'}" alt="${friend.display_name}" style="width: 48px; height: 48px; border-radius: 50%; border: 2px solid #e5e7eb;">
-            <div>
-              <div style="font-weight: 600; color: #1f2937; font-size: 16px;">${friend.display_name}</div>
-              <div style="color: #6b7280; font-size: 13px; margin-top: 4px;">${details.join(' | ')}</div>
-            </div>
-          </div>
-        </td>
-        <td style="padding: 15px; border-bottom: 1px solid #e5e7eb; vertical-align: middle; text-align: right;">
-          <span style="display: inline-block; background-color: ${getChangeTypeColor(changeType)}; color: #ffffff; padding: 6px 14px; border-radius: 12px; font-size: 12px; font-weight: 500;">${changeType}</span>
-        </td>
-      </tr>
-    `;
-  }).join('');
-
-  // 统计信息
-  const onlineCount = statusChanges.filter(c => c.changeType === '上线').length;
-  const offlineCount = statusChanges.filter(c => c.changeType === '下线').length;
-  const statusChangeCount = statusChanges.filter(c => c.changeType === '状态变化').length;
-  const worldChangeCount = statusChanges.filter(c => c.changeType === '切换世界').length;
-  
-  let summaryText = [];
-  if (onlineCount > 0) summaryText.push(`${onlineCount}人上线`);
-  if (offlineCount > 0) summaryText.push(`${offlineCount}人下线`);
-  if (statusChangeCount > 0) summaryText.push(`${statusChangeCount}人状态变化`);
-  if (worldChangeCount > 0) summaryText.push(`${worldChangeCount}人切换世界`);
-
-  const subject = `[VRC-Notifier] 好友状态批量更新: ${summaryText.join('，')} (${statusChanges.length}人)`;
-  
-  const html = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>vrc-notifier 好友状态通知</title>
-</head>
-<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f3f4f6;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f3f4f6; padding: 40px 20px;">
-    <tr>
-      <td align="center">
-        <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
-          <!-- Header -->
-          <tr>
-            <td style="background: linear-gradient(135deg, #3b82f6 0%, #60a5fa 100%); padding: 30px 40px; text-align: center;">
-              <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 600;">vrc-notifier</h1>
-              <p style="margin: 8px 0 0 0; color: rgba(255,255,255,0.9); font-size: 14px;">好友状态批量更新</p>
-            </td>
-          </tr>
-          
-          <!-- Summary -->
-          <tr>
-            <td style="padding: 30px 40px 20px 40px;">
-              <div style="background-color: #f0f9ff; border-radius: 12px; padding: 20px; text-align: center;">
-                <div style="font-size: 32px; font-weight: 700; color: #3b82f6; margin-bottom: 8px;">${statusChanges.length}</div>
-                <div style="color: #6b7280; font-size: 14px;">位好友状态发生变化</div>
-                <div style="margin-top: 12px; color: #374151; font-size: 13px;">${summaryText.join('，')}</div>
-              </div>
-            </td>
-          </tr>
-          
-          <!-- Changes List -->
-          <tr>
-            <td style="padding: 0 40px 40px 40px;">
-              <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; overflow: hidden;">
-                <thead>
-                  <tr>
-                    <th colspan="2" style="background-color: #f9fafb; padding: 15px 20px; text-align: left; color: #374151; font-size: 14px; font-weight: 600; border-bottom: 2px solid #e5e7eb;">变化详情</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${changesHtml}
-                </tbody>
-              </table>
-              
-              <!-- Timestamp -->
-              <div style="text-align: center; margin-top: 25px; padding-top: 25px; border-top: 1px solid #e5e7eb;">
-                <p style="margin: 0; color: #9ca3af; font-size: 13px;">通知时间: ${timestamp}</p>
-              </div>
-            </td>
-          </tr>
-          
-          <!-- Footer -->
-          <tr>
-            <td style="background-color: #f9fafb; padding: 20px 40px; text-align: center; border-top: 1px solid #e5e7eb;">
-              <p style="margin: 0; color: #9ca3af; font-size: 12px;">此邮件由 vrc-notifier 自动发送</p>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>`;
-
-  const mailOptions = {
-    from: `"vrc-notifier" <${user.smtp_user}>`,
-    to: user.email,
-    subject: subject,
-    html: html
-  };
-
-  try {
-    await transporter.sendMail(mailOptions);
-    console.log(`批量邮件通知已发送给 ${user.email}: ${statusChanges.length} 位好友状态变化`);
-    return true;
-  } catch (e) {
-    console.error('发送批量邮件失败:', e.message);
-    return false;
-  }
-}
-
-// 获取变化类型对应的颜色
-function getChangeTypeColor(changeType) {
-  const colors = {
-    '上线': '#10b981',
-    '下线': '#6b7280',
-    '状态变化': '#f59e0b',
-    '切换世界': '#3b82f6'
-  };
-  return colors[changeType] || '#6b7280';
-}
-
 // 默认邮件模板
 function getDefaultEmailTemplate() {
   return `<!DOCTYPE html>
@@ -1610,1349 +1391,6 @@ function getDefaultEmailTemplate() {
 }
 
 // 检查被监控好友的状态变化
-async function checkFriendStatus(user) {
-  if (!user.vrchat_user_id) {
-    return;
-  }
-
-  const session = userSessions.get(user.vrchat_user_id);
-  if (!session) {
-    return;
-  }
-
-  // 冷却期已移除:ws 模式登录时基线对齐取代(checkFriendStatus 仍由 cron 调用,第7组删除)
-
-  try {
-    // 检查用户是否开启仅监控好友状态模式
-    const statusOnlyMode = user.status_only_mode === 1;
-    
-    // 获取被监控的好友列表（普通模式最多5个，仅状态模式无限制）
-    const monitorConfigs = await new Promise((resolve, reject) => {
-      const sql = statusOnlyMode 
-        ? 'SELECT * FROM friend_monitor_config WHERE user_id = ? AND monitor_enabled = 1'
-        : 'SELECT * FROM friend_monitor_config WHERE user_id = ? AND monitor_enabled = 1';
-      db.all(
-        sql,
-        [user.id],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        }
-      );
-    });
-
-    if (monitorConfigs.length === 0) {
-      return;
-    }
-
-    const modeText = statusOnlyMode ? '[仅状态模式]' : '[标准模式]';
-    console.log(`[${formatLocalTime()}] ${modeText} 检查用户 ${user.display_name} 的 ${monitorConfigs.length} 个被监控好友`);
-
-    // 获取被监控好友的数据库记录
-    const monitoredFriendIds = monitorConfigs.map(c => c.friend_vrchat_id);
-    const dbFriends = await new Promise((resolve, reject) => {
-      db.all(
-        `SELECT * FROM friends WHERE user_id = ? AND friend_vrchat_id IN (${monitoredFriendIds.map(() => '?').join(',')})`,
-        [user.id, ...monitoredFriendIds],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        }
-      );
-    });
-
-    const dbFriendMap = new Map(dbFriends.map(f => [f.friend_vrchat_id, f]));
-    const monitorConfigMap = new Map(monitorConfigs.map(c => [c.friend_vrchat_id, c]));
-
-    // 获取在线好友列表（只获取一次，用于检查被监控好友的状态）
-    const friendsCacheKey = `friends_${user.vrchat_user_id}`;
-    const friendsRes = await cachedApiRequest(session.api, '/auth/user/friends', 'friendStatus', friendsCacheKey, user.vrchat_user_id);
-    if (friendsRes.status !== 200) {
-      console.error('获取好友列表失败:', friendsRes.status);
-      
-      // 如果是401错误，检测是否为登录游戏导致的会话失效
-      if (friendsRes.status === 401) {
-        console.error(`[游戏登录检测] 用户 ${user.display_name} 可能已登录 VRChat 游戏`);
-        console.error(`[说明] VRChat 不允许同一账号同时在游戏和第三方工具中保持登录状态`);
-        console.error(`[说明] 当您登录游戏时，本工具的会话将自动失效，这是正常行为`);
-        console.error(`[说明] 退出游戏后，您需要重新登录本工具以恢复监控`);
-        
-        // 发送SSE通知给前端（特殊类型：游戏登录导致）
-        sendGameLoginEvent(user.vrchat_user_id, user.display_name);
-        
-        // 发送邮件/Gotify通知
-        const notifyTitle = '[VRC-Notifier] 工具已暂停 - 检测到登录状态变化';
-        const notifyMessage = `您好 ${user.display_name}，\n\n检测到您的账号在另一个位置登录（可能是VRChat游戏或其他设备），本工具已自动暂停运行。\n\n原因说明：\nVRChat检测到您的账号IP地址发生变化，出于安全考虑自动使之前的登录会话失效。这是VRChat的安全机制，不是工具故障。\n\n解决方案：\n1. 方案一（推荐）：将本工具部署在与游戏相同的网络环境下（同一IP地址），然后先启动游戏，再启动本工具\n2. 方案二：退出游戏后，访问本工具网页重新登录即可恢复监控\n\n注意：\n如果需要在玩游戏时使用本工具监控好友，请确保工具和游戏的IP地址相同，并先开游戏再开工具。`;
-        
-        // 发送Gotify通知（如果配置了）
-        if (user.gotify_enabled) {
-          await sendGotifyNotification(user, notifyTitle, notifyMessage, 5);
-        }
-
-        // 发送NTFY通知（如果配置了）
-        if (user.ntfy_enabled) {
-          await sendNtfyNotification(user, notifyTitle, notifyMessage, 4, null);
-        }
-
-        // 发送邮件通知（如果配置了）
-        if (user.email && user.smtp_host) {
-          try {
-            const transporter = nodemailer.createTransport({
-              host: user.smtp_host,
-              port: user.smtp_port || 587,
-              secure: user.smtp_secure === 1,
-              auth: {
-                user: user.smtp_user,
-                pass: decrypt(user.smtp_pass)
-              }
-            });
-            
-            await transporter.sendMail({
-              from: `"VRC-Notifier" <${user.smtp_user}>`,
-              to: user.email,
-              subject: notifyTitle,
-              text: notifyMessage,
-              html: `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
-                <h2 style="color: #f59e0b;">工具已暂停</h2>
-                <p>您好 <strong>${user.display_name}</strong>，</p>
-                <p>检测到您的账号在另一个位置登录（可能是VRChat游戏或其他设备），本工具已自动暂停运行。</p>
-                
-                <div style="background: #fef3c7; border-left: 4px solid #f59e0b; padding: 15px; margin: 20px 0; border-radius: 0 8px 8px 0;">
-                  <h3 style="margin: 0 0 10px 0; color: #92400e;">原因说明</h3>
-                  <p style="margin: 0; color: #78350f;">VRChat检测到您的账号IP地址发生变化，出于安全考虑自动使之前的登录会话失效。这是VRChat的安全机制，不是工具故障。</p>
-                </div>
-                
-                <h3 style="color: #374151;">解决方案</h3>
-                <div style="background: #dbeafe; border-left: 4px solid #3b82f6; padding: 15px; margin: 15px 0; border-radius: 0 8px 8px 0;">
-                  <p style="margin: 0 0 10px 0; color: #1e40af;"><strong>方案一（推荐）：</strong></p>
-                  <p style="margin: 0; color: #1e3a8a;">将本工具部署在与游戏相同的网络环境下（同一IP地址），然后先启动游戏，再启动本工具</p>
-                </div>
-                <div style="background: #f3f4f6; border-left: 4px solid #6b7280; padding: 15px; margin: 15px 0; border-radius: 0 8px 8px 0;">
-                  <p style="margin: 0 0 10px 0; color: #374151;"><strong>方案二：</strong></p>
-                  <p style="margin: 0; color: #4b5563;">退出游戏后，访问本工具网页重新登录即可恢复监控</p>
-                </div>
-                
-                <div style="background: #fee2e2; border-left: 4px solid #ef4444; padding: 15px; margin: 20px 0; border-radius: 0 8px 8px 0;">
-                  <p style="margin: 0; color: #991b1b;"><strong>注意：</strong>如果需要在玩游戏时使用本工具监控好友，请确保工具和游戏的IP地址相同，并先开游戏再开工具。</p>
-                </div>
-              </div>`
-            });
-            
-            console.log(`[游戏登录检测] 已发送邮件通知给用户 ${user.display_name}`);
-          } catch (e) {
-            console.error(`[游戏登录检测] 发送邮件通知失败:`, e.message);
-          }
-        }
-        
-        // 清除用户会话
-        userSessions.delete(user.vrchat_user_id);
-        console.log(`[游戏登录检测] 已清除用户 ${user.display_name} 的会话，等待重新登录`);
-      }
-      
-      return;
-    }
-
-    // 构建好友状态映射表
-    const onlineFriendsMap = new Map();
-    for (const friend of friendsRes.data || []) {
-      onlineFriendsMap.set(friend.id, friend);
-    }
-
-    // 收集所有状态变化的好友
-    const statusChanges = [];
-
-    // 获取世界信息轮询索引（仅状态模式下跳过世界轮询）
-    let pollInfo = worldPollIndex.get(user.vrchat_user_id);
-    if (!pollInfo) {
-      pollInfo = { currentIndex: 0, lastPollTime: 0 };
-      worldPollIndex.set(user.vrchat_user_id, pollInfo);
-    }
-    
-    // 检查是否可以进行世界信息轮询（每10秒一个好友，仅状态模式下禁用）
-    const now = Date.now();
-    const canPollWorld = !statusOnlyMode && (now - pollInfo.lastPollTime >= 10000); // 10秒间隔，仅状态模式禁用
-    let worldPolledThisCheck = false;
-    
-    if (statusOnlyMode) {
-      console.log(`[仅状态模式] 跳过世界信息轮询，仅监控好友在线状态`);
-    }
-    
-    // 收集不在线的好友ID，用于统一输出日志
-    const skippedOfflineFriends = [];
-    
-    // 只检查被监控的好友
-    for (let i = 0; i < monitorConfigs.length; i++) {
-      const config = monitorConfigs[i];
-      const friendId = config.friend_vrchat_id;
-      let dbFriend = dbFriendMap.get(friendId);
-      
-      // 如果数据库中没有这个好友，从在线好友列表中获取并创建记录
-      if (!dbFriend) {
-        const onlineFriend = onlineFriendsMap.get(friendId);
-        if (onlineFriend) {
-          console.log(`[自动添加] 被监控的好友 ${friendId} 不在数据库中，从API数据创建记录`);
-
-          // 创建好友记录
-          const location = onlineFriend.location || 'offline';
-          const worldId = location !== 'offline' ? location.split(':')[0] : null;
-
-          // 获取头像URL
-          let avatarUrl = onlineFriend.profilePicOverride ||
-                          onlineFriend.currentAvatarImageUrl ||
-                          onlineFriend.currentAvatarThumbnailImageUrl ||
-                          onlineFriend.userIcon;
-          if (!avatarUrl || avatarUrl.includes('robot') || avatarUrl.includes('default')) {
-            avatarUrl = onlineFriend.profilePicOverride || onlineFriend.userIcon || 'https://assets.vrchat.com/www/images/default-avatar.png';
-          }
-
-          // 获取自定义状态
-          const statusDescription = onlineFriend.statusDescription || null;
-
-          // 插入数据库
-          // 初始状态设为好友当前实际状态，platform 记录当前平台
-          // world_name 初始为 null，等待第一轮轮询获取真实世界名称后再更新
-          const initialStatus = onlineFriend.status || 'offline';
-          const initialPlatform = onlineFriend.platform || 'unknown';
-          const newFriendId = await new Promise((resolve, reject) => {
-            db.run(
-              `INSERT INTO friends (user_id, friend_vrchat_id, display_name, avatar_url, status, state, world_id, world_name, status_description, platform, last_seen)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              [user.id, friendId, onlineFriend.displayName, avatarUrl,
-               initialStatus,
-               location === 'offline' ? 'offline' : 'online',
-               worldId, null, statusDescription, initialPlatform, new Date().toISOString()],
-              function(err) {
-                if (err) {
-                  console.error('插入好友记录失败:', err.message);
-                  reject(err);
-                } else {
-                  resolve(this.lastID);
-                }
-              }
-            );
-          });
-
-          console.log(`[自动添加] 好友 ${onlineFriend.displayName} 已添加到数据库，初始状态: ${initialStatus}, 平台: ${initialPlatform}`);
-          
-          // 重新获取刚插入的记录
-          dbFriend = await new Promise((resolve, reject) => {
-            db.get(
-              'SELECT * FROM friends WHERE id = ?',
-              [newFriendId],
-              (err, row) => {
-                if (err) reject(err);
-                else resolve(row);
-              }
-            );
-          });
-          
-        } else {
-          // 收集不在线的好友ID，稍后统一输出
-          skippedOfflineFriends.push(friendId);
-          continue;
-        }
-      }
-
-      // 从在线好友列表中获取最新状态
-      const onlineFriend = onlineFriendsMap.get(friendId);
-      
-      // 确定新状态
-      let newStatus, newWorldId, newWorldName, newLocation, newStatusDescription, newPlatform;
-
-      if (onlineFriend) {
-        // 好友在线 - 获取状态
-        newStatus = onlineFriend.status || 'active';
-        newLocation = onlineFriend.location || 'offline';
-        newWorldId = newLocation !== 'offline' ? newLocation.split(':')[0] : null;
-        // 获取自定义状态（可能为空）
-        newStatusDescription = onlineFriend.statusDescription || null;
-        // 获取平台信息
-        newPlatform = onlineFriend.platform || 'unknown';
-        
-        // 获取世界名称（轮询机制）
-        newWorldName = null;
-        
-        // 检查是否是当前轮询的好友
-        const isCurrentPollFriend = (i === pollInfo.currentIndex);
-        
-        // 只有当满足以下条件时才请求世界信息：
-        // 1. 有有效的世界ID
-        // 2. 到了轮询时间（每10秒）
-        // 3. 是当前轮询的好友
-        // 4. 状态是 active 或 join me（只有这两个状态能看到世界）
-        const canSeeWorld = ['active', 'join me'].includes(newStatus);
-        
-        if (newWorldId && newWorldId.startsWith('wrld_') &&
-            canPollWorld && isCurrentPollFriend && !worldPolledThisCheck && canSeeWorld) {
-          try {
-            const worldCacheKey = `world_${newWorldId}_${user.vrchat_user_id}`;
-            const worldRes = await cachedApiRequest(session.api, `/worlds/${newWorldId}`, 'worldInfo', worldCacheKey, user.vrchat_user_id);
-            if (worldRes.status === 200) {
-              newWorldName = worldRes.data.name;
-              worldPolledThisCheck = true;
-              pollInfo.lastPollTime = now;
-              console.log(`[世界信息轮询] 用户 ${user.display_name} 的好友 ${dbFriend.display_name}: ${newWorldName} (${pollInfo.currentIndex + 1}/${monitorConfigs.length})`);
-
-              // 检查是否是第一次获取世界名称（数据库中 world_name 为 null）
-              // 如果是，静默更新数据库，不发送世界变更通知
-              if (dbFriend.world_name === null && newWorldName) {
-                console.log(`[初始化世界] 好友 ${dbFriend.display_name} 第一次获取世界名称，静默更新数据库: ${newWorldName}`);
-                await new Promise((resolve, reject) => {
-                  db.run(
-                    'UPDATE friends SET world_name = ? WHERE id = ?',
-                    [newWorldName, dbFriend.id],
-                    (err) => {
-                      if (err) {
-                        console.error(`[初始化世界] 更新好友 ${dbFriend.display_name} 世界名称失败:`, err.message);
-                        reject(err);
-                      } else {
-                        console.log(`[初始化世界] 好友 ${dbFriend.display_name} 世界名称已更新为: ${newWorldName}`);
-                        resolve();
-                      }
-                    }
-                  );
-                });
-                // 更新 dbFriend 对象，避免后续判断为状态变化
-                dbFriend.world_name = newWorldName;
-              }
-            }
-          } catch (e) {
-            console.error(`获取世界 ${newWorldId} 失败:`, e.message);
-          }
-        } else if (!canSeeWorld && isCurrentPollFriend && canPollWorld && !worldPolledThisCheck) {
-          console.log(`[世界信息] 跳过 ${newStatus} 状态的好友 ${dbFriend.display_name}（无法看到世界）`);
-        }
-
-        // 如果没有获取到世界名称，使用数据库中的旧值（如果有且世界ID相同）
-        if (!newWorldName && dbFriend.world_name && dbFriend.world_id === newWorldId) {
-          newWorldName = dbFriend.world_name;
-        }
-      } else {
-        // 好友离线
-        newStatus = 'offline';
-        newLocation = 'offline';
-        newWorldId = null;
-        newWorldName = null;
-        newStatusDescription = null;
-        newPlatform = 'offline';
-      }
-
-      const oldStatus = dbFriend.status;
-      const oldWorld = dbFriend.world_name;
-      const oldStatusDescription = dbFriend.status_description;
-      const oldPlatform = dbFriend.platform || 'unknown';
-      const pendingStatus = dbFriend.pending_status;
-      const pendingCount = dbFriend.pending_count || 0;
-
-      // 判断平台是否变化（用于检测网页端<->游戏切换）
-      const wasWebPlatform = oldPlatform === 'web';
-      const isWebPlatform = newPlatform === 'web';
-
-      // 检查状态是否变化（包括自定义状态）
-      // 同时检查平台变化（网页端<->游戏在线切换）
-      const isStatusDifferent = oldStatus !== newStatus || (oldWorld !== newWorldName && newWorldName) || (wasWebPlatform !== isWebPlatform);
-      // 检查自定义状态是否变化（无需防抖，直接检测）
-      const isStatusDescriptionDifferent = oldStatusDescription !== newStatusDescription;
-
-      // 判断是否为游戏在线状态（active, join me, ask me, busy）- 移到外部作用域
-      const isGameOnline = (status) => ['active', 'join me', 'ask me', 'busy'].includes(status);
-
-      if (isStatusDifferent) {
-        console.log(`[状态检测] 好友 ${dbFriend.display_name} 检测到状态变化: ${oldStatus} -> ${newStatus}`);
-
-        const wasGameOnline = isGameOnline(oldStatus);
-        const isNowGameOnline = isGameOnline(newStatus);
-        
-        // 判断是否是上下线变化（需要防抖动）
-        // 包括：离线<->游戏在线，网页端<->游戏在线（平台切换），离线<->网页端
-        const isOnlineOfflineChange = (oldStatus === 'offline' && isNowGameOnline) || 
-                                       (wasGameOnline && newStatus === 'offline') ||
-                                       (wasWebPlatform && !isWebPlatform && isNowGameOnline) ||
-                                       (!wasWebPlatform && isWebPlatform && wasGameOnline) ||
-                                       (oldStatus === 'offline' && isWebPlatform) ||
-                                       (wasWebPlatform && newStatus === 'offline');
-        
-        // 防抖动逻辑：只有上下线时才需要连续3次确认
-        let shouldNotify = false;
-        let confirmedStatus = newStatus;
-        let confirmedWorld = newWorldName;
-        
-        if (isOnlineOfflineChange) {
-          // 上下线变化：使用防抖动机制（3次确认）
-          console.log(`[防抖动] 好友 ${dbFriend.display_name} 上下线变化，启用防抖动检测`);
-          
-          if (newStatus === pendingStatus) {
-            // 连续检测到相同的新状态，确认变化（需要3次）
-            if (pendingCount >= 2) {
-              console.log(`[防抖动确认] 好友 ${dbFriend.display_name} 上下线变化已确认(3/3): ${oldStatus} -> ${newStatus}`);
-              shouldNotify = true;
-            } else {
-              console.log(`[防抖动等待] 好友 ${dbFriend.display_name} 等待下次确认 (${pendingCount + 1}/3)`);
-            }
-          } else {
-            // 第一次检测到变化，记录待确认状态
-            console.log(`[防抖动记录] 好友 ${dbFriend.display_name} 记录待确认状态: ${newStatus}`);
-          }
-          
-          // 更新待确认状态到数据库
-          const newPendingCount = (newStatus === pendingStatus) ? pendingCount + 1 : 1;
-          await new Promise((resolve, reject) => {
-            db.run(
-              `UPDATE friends SET pending_status = ?, pending_count = ? WHERE id = ?`,
-              [newStatus, newPendingCount, dbFriend.id],
-              (err) => {
-                if (err) reject(err);
-                else resolve();
-              }
-            );
-          });
-          
-          // 如果未确认变化，跳过通知
-          if (!shouldNotify) {
-            continue;
-          }
-        } else {
-          // 非上下线变化（状态之间切换）：直接通知，不防抖
-          console.log(`[直接通知] 好友 ${dbFriend.display_name} 状态切换，直接通知: ${oldStatus} -> ${newStatus}`);
-          shouldNotify = true;
-          
-          // 重置防抖动计数（如果有的话）
-          if (pendingStatus) {
-            await new Promise((resolve, reject) => {
-              db.run(
-                `UPDATE friends SET pending_status = NULL, pending_count = 0 WHERE id = ?`,
-                [dbFriend.id],
-                (err) => {
-                  if (err) reject(err);
-                  else resolve();
-                }
-              );
-            });
-          }
-        }
-
-        // 使用之前定义的 isGameOnline 函数
-        const wasGameOnlineFinal = isGameOnline(oldStatus);
-        const isNowGameOnlineFinal = isGameOnline(confirmedStatus);
-        
-        // 判断变化类型
-        let isWorldChange = false;
-        let isStatusChange = false;
-        let changeType = '';
-        
-        // 世界改变通知（仅当状态为 active 或 join me 时才通知，仅状态模式下禁用）
-        // 注意：世界变化和状态变化可以同时进行，使用独立的 if 判断
-        if (!statusOnlyMode && ['active', 'join me'].includes(oldStatus) && ['active', 'join me'].includes(confirmedStatus) && 
-            oldWorld !== confirmedWorld && confirmedWorld && config.notify_world_change) {
-          isWorldChange = true;
-        }
-        
-        // 上线通知：从离线 -> 游戏在线（四个状态之一）
-        if (oldStatus === 'offline' && isNowGameOnlineFinal && config.notify_online) {
-          isStatusChange = true;
-          changeType = '上线';
-        }
-        // 下线通知：从游戏在线 -> 离线
-        else if (wasGameOnlineFinal && confirmedStatus === 'offline' && config.notify_offline) {
-          isStatusChange = true;
-          changeType = '下线';
-        }
-        // 平台切换通知：从网页端 -> 游戏在线
-        else if (wasWebPlatform && !isWebPlatform && confirmedStatus !== 'offline' && config.notify_online) {
-          isStatusChange = true;
-          changeType = 'web端上线';
-          console.log(`[平台切换] 好友 ${dbFriend.display_name} 从web端上线至游戏`);
-        }
-        // 平台切换通知：从游戏在线 -> 网页端
-        else if (!wasWebPlatform && isWebPlatform && wasGameOnlineFinal && config.notify_offline) {
-          isStatusChange = true;
-          changeType = '下线至web端';
-          console.log(`[平台切换] 好友 ${dbFriend.display_name} 下线至web端`);
-        }
-        // 从离线 -> 网页端：终端显示但不通知用户
-        else if (oldStatus === 'offline' && isWebPlatform && !isNowGameOnlineFinal) {
-          console.log(`[网页端上线] 好友 ${dbFriend.display_name} 从离线变为网页端在线，终端显示但不通知用户`);
-          isStatusChange = false;
-        }
-        // 从网页端 -> 离线：终端显示但不通知用户
-        else if (wasWebPlatform && confirmedStatus === 'offline') {
-          console.log(`[网页端下线] 好友 ${dbFriend.display_name} 从网页端变为离线，终端显示但不通知用户`);
-          isStatusChange = false;
-        }
-        // 状态改变通知：游戏在线状态之间的切换（active <-> join me <-> ask me <-> busy）
-        else if (wasGameOnlineFinal && isNowGameOnlineFinal && oldStatus !== confirmedStatus && config.notify_status_change) {
-          isStatusChange = true;
-          changeType = '状态变化';
-        }
-        // 网页端内部状态变化不通知
-        else if (wasWebPlatform && isWebPlatform && oldStatus !== newStatus) {
-          console.log(`[网页端状态变化] 好友 ${dbFriend.display_name} 网页端内部状态变化: ${oldStatus} -> ${newStatus}，跳过通知`);
-          isStatusChange = false;
-        }
-
-        // 状态变化立即发送单条邮件和Gotify推送
-        if (isStatusChange) {
-          console.log(`[邮件通知] 好友 ${dbFriend.display_name} ${changeType}，发送单条通知`);
-          await sendEmailNotification(user, {
-            friend: dbFriend,
-            oldStatus,
-            newStatus,
-            oldWorld,
-            newWorld: newWorldName,
-            changeType,
-            oldStatusDescription,
-            newStatusDescription,
-            oldPlatform,
-            newPlatform
-          });
-          
-          // 发送 Gotify 推送（使用智能标题，让用户一眼看到变化）
-          const timestamp = new Date().toLocaleString('zh-CN');
-          // NTFY 使用横杠格式时间，避免被识别为电话号码
-          const ntfyTimestamp = formatDateSafe(new Date());
-
-          // 使用智能标题生成（如果用户没有自定义模板）
-          let gotifyTitle, gotifyMessage;
-          const userTitleTemplate = user.gotify_title_template;
-          const userMessageTemplate = user.gotify_message_template;
-          
-          if (!userTitleTemplate || userTitleTemplate === '[VRC-Notifier] {changeType}: {friendName}') {
-            // 使用智能标题（默认情况）
-            gotifyTitle = generateGotifyTitle(
-              dbFriend.display_name,
-              changeType,
-              oldStatus,
-              newStatus,
-              oldWorld,
-              newWorldName
-            );
-          } else {
-            // 使用用户自定义模板
-            const templateVars = {
-              friendName: dbFriend.display_name,
-              changeType: changeType,
-              oldStatus: oldStatus || '未知',
-              newStatus: newStatus || '未知',
-              oldWorld: oldWorld || '-',
-              newWorld: newWorldName || '-',
-              oldStatusDescription: oldStatusDescription || '无',
-              newStatusDescription: newStatusDescription || '无',
-              timestamp: timestamp,
-              oldPlatform: getPlatformDisplayName(oldPlatform || 'unknown'),
-              newPlatform: getPlatformDisplayName(newPlatform || 'unknown')
-            };
-            gotifyTitle = renderGotifyTemplate(userTitleTemplate, templateVars);
-          }
-
-          if (!userMessageTemplate || userMessageTemplate.includes('{friendName}')) {
-            // 使用智能消息内容（默认情况）
-            gotifyMessage = generateGotifyMessage(
-              dbFriend.display_name,
-              changeType,
-              oldStatus,
-              newStatus,
-              oldWorld,
-              newWorldName,
-              timestamp,
-              oldStatusDescription,
-              newStatusDescription
-            );
-          } else {
-            // 使用用户自定义模板
-            const templateVars = {
-              friendName: dbFriend.display_name,
-              changeType: changeType,
-              oldStatus: oldStatus || '未知',
-              newStatus: newStatus || '未知',
-              oldWorld: oldWorld || '-',
-              newWorld: newWorldName || '-',
-              oldStatusDescription: oldStatusDescription || '无',
-              newStatusDescription: newStatusDescription || '无',
-              timestamp: timestamp,
-              oldPlatform: getPlatformDisplayName(oldPlatform || 'unknown'),
-              newPlatform: getPlatformDisplayName(newPlatform || 'unknown')
-            };
-            gotifyMessage = renderGotifyTemplate(userMessageTemplate, templateVars);
-          }
-          
-          // 构建 extras 支持 Markdown 格式
-          const extras = {
-            'client::display': {
-              'contentType': 'text/markdown'
-            }
-          };
-          
-          await sendGotifyNotification(user, gotifyTitle, gotifyMessage, user.gotify_priority || 5, extras);
-
-          // 发送 NTFY 推送（使用 NTFY 自己的模板）
-          if (user.ntfy_enabled) {
-            const ntfyTitleTemplate = user.ntfy_title_template;
-            const ntfyMessageTemplate = user.ntfy_message_template;
-            let ntfyTitle, ntfyMessage;
-            
-            // 生成 NTFY 标题（使用 RFC 2047 编码支持中文）
-            if (!ntfyTitleTemplate || ntfyTitleTemplate === '[VRC-Notifier] {changeType}: {friendName}') {
-              ntfyTitle = generateGotifyTitle(
-                dbFriend.display_name,
-                changeType,
-                oldStatus,
-                newStatus,
-                oldWorld,
-                newWorldName
-              );
-            } else {
-              const templateVars = {
-                friendName: dbFriend.display_name,
-                changeType: changeType,
-                oldStatus: oldStatus || '未知',
-                newStatus: newStatus || '未知',
-                oldWorld: oldWorld || '-',
-                newWorld: newWorldName || '-',
-                oldStatusDescription: oldStatusDescription || '无',
-                newStatusDescription: newStatusDescription || '无',
-                timestamp: ntfyTimestamp,
-                ntfyTimestamp: ntfyTimestamp,
-                oldPlatform: getPlatformDisplayName(oldPlatform || 'unknown'),
-                newPlatform: getPlatformDisplayName(newPlatform || 'unknown')
-              };
-              ntfyTitle = renderGotifyTemplate(ntfyTitleTemplate, templateVars);
-            }
-
-            // 生成 NTFY 消息
-            if (!ntfyMessageTemplate || ntfyMessageTemplate.includes('{friendName}')) {
-              ntfyMessage = generateGotifyMessage(
-                dbFriend.display_name,
-                changeType,
-                oldStatus,
-                newStatus,
-                oldWorld,
-                newWorldName,
-                ntfyTimestamp,
-                oldStatusDescription,
-                newStatusDescription
-              );
-            } else {
-              const templateVars = {
-                friendName: dbFriend.display_name,
-                changeType: changeType,
-                oldStatus: oldStatus || '未知',
-                newStatus: newStatus || '未知',
-                oldWorld: oldWorld || '-',
-                newWorld: newWorldName || '-',
-                oldStatusDescription: oldStatusDescription || '无',
-                newStatusDescription: newStatusDescription || '无',
-                timestamp: ntfyTimestamp,
-                ntfyTimestamp: ntfyTimestamp,
-                oldPlatform: getPlatformDisplayName(oldPlatform || 'unknown'),
-                newPlatform: getPlatformDisplayName(newPlatform || 'unknown')
-              };
-              ntfyMessage = renderGotifyTemplate(ntfyMessageTemplate, templateVars);
-            }
-            
-            // 不使用图标标签，保持简洁
-            await sendNtfyNotification(user, ntfyTitle, ntfyMessage, user.ntfy_priority || 3, null);
-          }
-
-          // 发送通用 Webhook 推送
-          const eventType = oldStatus === 'offline' ? 'friend_online' :
-                           newStatus === 'offline' ? 'friend_offline' : 'status_change';
-          await sendWebhookNotification(user, {
-            friendName: dbFriend.display_name,
-            oldStatus,
-            newStatus,
-            oldWorld,
-            newWorld: newWorldName,
-            changeType,
-            oldStatusDescription,
-            newStatusDescription,
-            timestamp: new Date().toLocaleString('zh-CN'),
-            avatarUrl: dbFriend.avatar_url,
-            eventType: eventType,
-            oldPlatform: oldPlatform || 'unknown',
-            newPlatform: newPlatform || 'unknown',
-            oldPlatformDisplay: getPlatformDisplayName(oldPlatform || 'unknown'),
-            newPlatformDisplay: getPlatformDisplayName(newPlatform || 'unknown')
-          });
-        }
-
-        // 世界变化缓存到缓冲区，等待轮询完一轮后批量发送
-        // 注意：世界变化和状态变化可以同时进行，使用独立的 if 判断
-        // 但如果已经有状态变化通知，世界变化信息已经包含在状态通知中，不再单独缓存
-        if (isWorldChange && !isStatusChange) {
-          let buffer = worldChangeBuffer.get(user.id);
-          if (!buffer) {
-            buffer = { changes: [], lastPollRound: 0 };
-            worldChangeBuffer.set(user.id, buffer);
-          }
-          buffer.changes.push({
-            friend: dbFriend,
-            oldStatus,
-            newStatus,
-            oldWorld,
-            newWorld: newWorldName,
-            changeType: '切换世界',
-            oldStatusDescription,
-            newStatusDescription
-          });
-          console.log(`[世界变化缓存] 好友 ${dbFriend.display_name} 世界变化已缓存，当前缓存 ${buffer.changes.length} 个变化`);
-        } else if (isWorldChange && isStatusChange) {
-          console.log(`[世界变化] 好友 ${dbFriend.display_name} 同时有状态变化，世界信息已包含在状态通知中`);
-        }
-
-        // 检查是否同时有自定义状态变化（状态变化时也要检查）
-        // 排除从离线到上线的情况（此时 oldStatusDescription 为 null，会误判为变化）
-        const isFromOfflineToOnlineInStatusChange = oldStatus === 'offline' && isNowGameOnlineFinal;
-        if (isStatusDescriptionDifferent && newStatus !== 'offline' && !isFromOfflineToOnlineInStatusChange) {
-          console.log(`[自定义状态变化] 好友 ${dbFriend.display_name} 同时有自定义状态变化: "${oldStatusDescription || '无'}" -> "${newStatusDescription || '无'}"`);
-          
-          // 发送自定义状态变化通知
-          const timestamp = new Date().toLocaleString('zh-CN');
-          const customChangeType = '自定义状态';
-          
-          // 发送邮件通知
-          await sendEmailNotification(user, {
-            friend: dbFriend,
-            oldStatus,
-            newStatus,
-            oldWorld,
-            newWorld: newWorldName,
-            changeType: customChangeType,
-            oldStatusDescription,
-            newStatusDescription,
-            oldPlatform,
-            newPlatform
-          });
-          
-          // 发送 Gotify 推送
-          let customGotifyTitle, customGotifyMessage;
-          const userTitleTemplate = user.gotify_title_template;
-          const userMessageTemplate = user.gotify_message_template;
-          
-          if (!userTitleTemplate || userTitleTemplate === '[VRC-Notifier] {changeType}: {friendName}') {
-            // 使用智能标题（默认情况）
-            customGotifyTitle = `${dbFriend.display_name} 更新了自定义状态`;
-          } else {
-            // 使用用户自定义模板
-            const templateVars = {
-              friendName: dbFriend.display_name,
-              changeType: customChangeType,
-              oldStatus: oldStatus || '未知',
-              newStatus: newStatus || '未知',
-              oldWorld: oldWorld || '-',
-              newWorld: newWorldName || '-',
-              oldStatusDescription: oldStatusDescription || '无',
-              newStatusDescription: newStatusDescription || '无',
-              timestamp: timestamp
-            };
-            customGotifyTitle = renderGotifyTemplate(userTitleTemplate, templateVars);
-          }
-          
-          if (!userMessageTemplate || userMessageTemplate.includes('{friendName}')) {
-            // 使用智能消息内容（默认情况）
-            const oldDesc = oldStatusDescription || '无';
-            const newDesc = newStatusDescription || '无';
-            customGotifyMessage = `${dbFriend.display_name} 更新了自定义状态\n\n` +
-                           `之前: ${oldDesc}\n` +
-                           `现在: ${newDesc}\n\n` +
-                           `当前状态: ${newStatus}\n` +
-                           `时间: ${timestamp}`;
-          } else {
-            // 使用用户自定义模板
-            const templateVars = {
-              friendName: dbFriend.display_name,
-              changeType: customChangeType,
-              oldStatus: oldStatus || '未知',
-              newStatus: newStatus || '未知',
-              oldWorld: oldWorld || '-',
-              newWorld: newWorldName || '-',
-              oldStatusDescription: oldStatusDescription || '无',
-              newStatusDescription: newStatusDescription || '无',
-              timestamp: timestamp
-            };
-            customGotifyMessage = renderGotifyTemplate(userMessageTemplate, templateVars);
-          }
-          
-          // 构建 extras 支持 Markdown 格式
-          const customExtras = {
-            'client::display': {
-              'contentType': 'text/markdown'
-            }
-          };
-          
-          await sendGotifyNotification(user, customGotifyTitle, customGotifyMessage, user.gotify_priority || 5, customExtras);
-
-          // 发送 NTFY 推送（使用 NTFY 自己的模板）
-          if (user.ntfy_enabled) {
-            const ntfyTitleTemplate = user.ntfy_title_template;
-            const ntfyMessageTemplate = user.ntfy_message_template;
-            let ntfyTitle, ntfyMessage;
-            
-            // 生成 NTFY 标题
-            if (!ntfyTitleTemplate || ntfyTitleTemplate === '[VRC-Notifier] {changeType}: {friendName}') {
-              ntfyTitle = `${dbFriend.display_name} 更新了自定义状态`;
-            } else {
-              const templateVars = {
-                friendName: dbFriend.display_name,
-                changeType: customChangeType,
-                oldStatus: oldStatus || '未知',
-                newStatus: newStatus || '未知',
-                oldWorld: oldWorld || '-',
-                newWorld: newWorldName || '-',
-                oldStatusDescription: oldStatusDescription || '无',
-                newStatusDescription: newStatusDescription || '无',
-                timestamp: timestamp
-              };
-              ntfyTitle = renderGotifyTemplate(ntfyTitleTemplate, templateVars);
-            }
-            
-            // 生成 NTFY 消息
-            if (!ntfyMessageTemplate || ntfyMessageTemplate.includes('{friendName}')) {
-              const oldDesc = oldStatusDescription || '无';
-              const newDesc = newStatusDescription || '无';
-              const ntfyCustomTimestamp = formatDateSafe(new Date());
-              ntfyMessage = `${dbFriend.display_name} 更新了自定义状态\n\n` +
-                             `之前: ${oldDesc}\n` +
-                             `现在: ${newDesc}\n\n` +
-                             `当前状态: ${newStatus}\n` +
-                             `时间: ${ntfyCustomTimestamp}`;
-            } else {
-              const templateVars = {
-                friendName: dbFriend.display_name,
-                changeType: customChangeType,
-                oldStatus: oldStatus || '未知',
-                newStatus: newStatus || '未知',
-                oldWorld: oldWorld || '-',
-                newWorld: newWorldName || '-',
-                oldStatusDescription: oldStatusDescription || '无',
-                newStatusDescription: newStatusDescription || '无',
-                timestamp: timestamp
-              };
-              ntfyMessage = renderGotifyTemplate(ntfyMessageTemplate, templateVars);
-            }
-            
-            await sendNtfyNotification(user, ntfyTitle, ntfyMessage, user.ntfy_priority || 3, null);
-          }
-
-          // 发送通用 Webhook 推送
-          await sendWebhookNotification(user, {
-            friendName: dbFriend.display_name,
-            oldStatus,
-            newStatus,
-            oldWorld,
-            newWorld: newWorldName,
-            oldStatusDescription,
-            newStatusDescription,
-            changeType: customChangeType,
-            timestamp: new Date().toLocaleString('zh-CN'),
-            avatarUrl: dbFriend.avatar_url,
-            eventType: 'status_description_change',
-            oldPlatform: oldPlatform || 'unknown',
-            newPlatform: newPlatform || 'unknown',
-            oldPlatformDisplay: getPlatformDisplayName(oldPlatform || 'unknown'),
-            newPlatformDisplay: getPlatformDisplayName(newPlatform || 'unknown')
-          });
-        }
-
-        // 更新好友信息（确认状态变化后，重置防抖动计数）
-        await new Promise((resolve, reject) => {
-          db.run(
-            `UPDATE friends SET status = ?, state = ?, world_id = ?, world_name = ?, status_description = ?, platform = ?, last_seen = ?, pending_status = NULL, pending_count = 0
-             WHERE id = ?`,
-            [confirmedStatus, newLocation === 'offline' ? 'offline' : 'online', newWorldId, confirmedWorld, newStatusDescription,
-             newPlatform, new Date().toISOString(), dbFriend.id],
-            (err) => {
-              if (err) reject(err);
-              else resolve();
-            }
-          );
-        });
-      } else {
-        // 状态没有变化，检查是否需要重置防抖动计数（如果当前状态与待确认状态不一致）
-        if (pendingStatus && oldStatus !== pendingStatus && oldStatus === newStatus) {
-          // 状态恢复到了原来的状态，重置防抖动
-          console.log(`[防抖动重置] 好友 ${dbFriend.display_name} 状态恢复，重置防抖动计数`);
-          await new Promise((resolve, reject) => {
-            db.run(
-              `UPDATE friends SET pending_status = NULL, pending_count = 0 WHERE id = ?`,
-              [dbFriend.id],
-              (err) => {
-                if (err) reject(err);
-                else resolve();
-              }
-            );
-          });
-        }
-        
-        // 检查自定义状态是否变化（无需防抖，直接通知）
-        // 排除从离线到上线的情况（此时 oldStatusDescription 为 null，newStatusDescription 为用户设置的值，会误判为变化）
-        const isNowGameOnlineForCheck = isGameOnline(newStatus);
-        const isFromOfflineToOnline = oldStatus === 'offline' && isNowGameOnlineForCheck;
-        if (isStatusDescriptionDifferent && newStatus !== 'offline' && !isFromOfflineToOnline) {
-          console.log(`[自定义状态变化] 好友 ${dbFriend.display_name} 自定义状态变化: "${oldStatusDescription || '无'}" -> "${newStatusDescription || '无'}"`);
-          
-          // 发送自定义状态变化通知
-          const timestamp = new Date().toLocaleString('zh-CN');
-          const changeType = '自定义状态';
-          
-          // 发送邮件通知
-          await sendEmailNotification(user, {
-            friend: dbFriend,
-            oldStatus,
-            newStatus,
-            oldWorld,
-            newWorld: newWorldName,
-            changeType,
-            oldStatusDescription,
-            newStatusDescription,
-            oldPlatform,
-            newPlatform
-          });
-          
-          // 发送 Gotify 推送
-          let gotifyTitle, gotifyMessage;
-          const userTitleTemplate = user.gotify_title_template;
-          const userMessageTemplate = user.gotify_message_template;
-          
-          if (!userTitleTemplate || userTitleTemplate === '[VRC-Notifier] {changeType}: {friendName}') {
-            // 使用智能标题（默认情况）
-            gotifyTitle = `${dbFriend.display_name} 更新了自定义状态`;
-          } else {
-            // 使用用户自定义模板
-            const templateVars = {
-              friendName: dbFriend.display_name,
-              changeType: changeType,
-              oldStatus: oldStatus || '未知',
-              newStatus: newStatus || '未知',
-              oldWorld: oldWorld || '-',
-              newWorld: newWorldName || '-',
-              oldStatusDescription: oldStatusDescription || '无',
-              newStatusDescription: newStatusDescription || '无',
-              timestamp: timestamp
-            };
-            gotifyTitle = renderGotifyTemplate(userTitleTemplate, templateVars);
-          }
-          
-          if (!userMessageTemplate || userMessageTemplate.includes('{friendName}')) {
-            // 使用智能消息内容（默认情况）
-            const oldDesc = oldStatusDescription || '无';
-            const newDesc = newStatusDescription || '无';
-            gotifyMessage = `${dbFriend.display_name} 更新了自定义状态\n\n` +
-                           `之前: ${oldDesc}\n` +
-                           `现在: ${newDesc}\n\n` +
-                           `当前状态: ${newStatus}\n` +
-                           `时间: ${timestamp}`;
-          } else {
-            // 使用用户自定义模板
-            const templateVars = {
-              friendName: dbFriend.display_name,
-              changeType: changeType,
-              oldStatus: oldStatus || '未知',
-              newStatus: newStatus || '未知',
-              oldWorld: oldWorld || '-',
-              newWorld: newWorldName || '-',
-              oldStatusDescription: oldStatusDescription || '无',
-              newStatusDescription: newStatusDescription || '无',
-              timestamp: timestamp
-            };
-            gotifyMessage = renderGotifyTemplate(userMessageTemplate, templateVars);
-          }
-          
-          // 构建 extras 支持 Markdown 格式
-          const extras = {
-            'client::display': {
-              'contentType': 'text/markdown'
-            }
-          };
-          
-          await sendGotifyNotification(user, gotifyTitle, gotifyMessage, user.gotify_priority || 5, extras);
-          
-          // 发送 NTFY 推送
-          const ntfyTimestamp = formatDateSafe(new Date());
-          const ntfyTitle = `${dbFriend.display_name} 更新了自定义状态`;
-          const oldDesc = oldStatusDescription || '无';
-          const newDesc = newStatusDescription || '无';
-          const ntfyMessage = `${dbFriend.display_name} 更新了自定义状态\n\n` +
-                             `之前: ${oldDesc}\n` +
-                             `现在: ${newDesc}\n\n` +
-                             `当前状态: ${newStatus}\n` +
-                             `时间: ${ntfyTimestamp}`;
-          await sendNtfyNotification(user, ntfyTitle, ntfyMessage, user.ntfy_priority || 3, null);
-          
-          // 发送通用 Webhook 推送
-          await sendWebhookNotification(user, {
-            friendName: dbFriend.display_name,
-            oldStatus,
-            newStatus,
-            oldWorld,
-            newWorld: newWorldName,
-            oldStatusDescription,
-            newStatusDescription,
-            changeType,
-            timestamp: new Date().toLocaleString('zh-CN'),
-            avatarUrl: dbFriend.avatar_url,
-            eventType: 'status_description_change',
-            oldPlatform: oldPlatform || 'unknown',
-            newPlatform: newPlatform || 'unknown',
-            oldPlatformDisplay: getPlatformDisplayName(oldPlatform || 'unknown'),
-            newPlatformDisplay: getPlatformDisplayName(newPlatform || 'unknown')
-          });
-          
-          // 更新数据库中的自定义状态
-          await new Promise((resolve, reject) => {
-            db.run(
-              `UPDATE friends SET status_description = ? WHERE id = ?`,
-              [newStatusDescription, dbFriend.id],
-              (err) => {
-                if (err) reject(err);
-                else resolve();
-              }
-            );
-          });
-        }
-      }
-    }
-
-    // 统一输出不在线的好友日志（避免刷屏）
-    if (skippedOfflineFriends.length > 0) {
-      console.log(`已跳过 ${skippedOfflineFriends.length} 个不在线的监控好友`);
-    }
-
-    // 更新世界信息轮询索引（每10秒移动到下一个好友，无论是否成功获取世界信息）
-    if (canPollWorld) {
-      const previousIndex = pollInfo.currentIndex;
-      pollInfo.currentIndex = (pollInfo.currentIndex + 1) % monitorConfigs.length;
-      console.log(`[世界信息轮询] 下次将检查好友索引 ${pollInfo.currentIndex + 1}/${monitorConfigs.length}`);
-      
-      // 检查是否完成了一轮轮询（回到了第一个好友）
-      if (pollInfo.currentIndex === 0 && previousIndex === monitorConfigs.length - 1) {
-        console.log(`[世界变化] 完成一轮轮询，检查是否有缓存的世界变化`);
-        const buffer = worldChangeBuffer.get(user.id);
-        if (buffer && buffer.changes.length > 0) {
-          if (buffer.changes.length === 1) {
-            // 只有1个世界变化，使用单条发送（与邮件逻辑一致）
-            console.log(`[邮件通知] 只有1个世界变化，发送单条通知`);
-            await sendEmailNotification(user, buffer.changes[0]);
-            
-            // 发送 Gotify 推送（使用智能标题，让用户一眼看到世界变化）
-            const change = buffer.changes[0];
-            const timestamp = new Date().toLocaleString('zh-CN');
-            // NTFY 使用横杠格式时间，避免被识别为电话号码
-            const ntfyTimestamp = formatDateSafe(new Date());
-
-            // 使用智能标题生成（如果用户没有自定义模板）
-            let gotifyTitle, gotifyMessage;
-            const userTitleTemplate = user.gotify_title_template;
-            const userMessageTemplate = user.gotify_message_template;
-            
-            if (!userTitleTemplate || userTitleTemplate === '[VRC-Notifier] {changeType}: {friendName}') {
-              // 使用智能标题（默认情况）- 世界变化时标题直接显示世界变化
-              gotifyTitle = generateGotifyTitle(
-                change.friend.display_name,
-                change.changeType,
-                change.oldStatus,
-                change.newStatus,
-                change.oldWorld,
-                change.newWorld
-              );
-            } else {
-              // 使用用户自定义模板
-              const templateVars = {
-                friendName: change.friend.display_name,
-                changeType: change.changeType,
-                oldStatus: change.oldStatus || '未知',
-                newStatus: change.newStatus || '未知',
-                oldWorld: change.oldWorld || '-',
-                newWorld: change.newWorld || '-',
-                oldStatusDescription: change.oldStatusDescription || '无',
-                newStatusDescription: change.newStatusDescription || '无',
-                timestamp: timestamp
-              };
-              gotifyTitle = renderGotifyTemplate(userTitleTemplate, templateVars);
-            }
-
-            if (!userMessageTemplate || userMessageTemplate.includes('{friendName}')) {
-              // 使用智能消息内容（默认情况）
-              gotifyMessage = generateGotifyMessage(
-                change.friend.display_name,
-                change.changeType,
-                change.oldStatus,
-                change.newStatus,
-                change.oldWorld,
-                change.newWorld,
-                timestamp,
-                change.oldStatusDescription,
-                change.newStatusDescription
-              );
-            } else {
-              // 使用用户自定义模板
-              const templateVars = {
-                friendName: change.friend.display_name,
-                changeType: change.changeType,
-                oldStatus: change.oldStatus || '未知',
-                newStatus: change.newStatus || '未知',
-                oldWorld: change.oldWorld || '-',
-                newWorld: change.newWorld || '-',
-                oldStatusDescription: change.oldStatusDescription || '无',
-                newStatusDescription: change.newStatusDescription || '无',
-                timestamp: timestamp
-              };
-              gotifyMessage = renderGotifyTemplate(userMessageTemplate, templateVars);
-            }
-            
-            const extras = {
-              'client::display': {
-                'contentType': 'text/markdown'
-              }
-            };
-            
-            await sendGotifyNotification(user, gotifyTitle, gotifyMessage, user.gotify_priority || 5, extras);
-
-            // 发送 NTFY 推送（单个世界变化，使用 NTFY 自己的模板）
-            if (user.ntfy_enabled) {
-              const ntfyTitleTemplate = user.ntfy_title_template;
-              const ntfyMessageTemplate = user.ntfy_message_template;
-              let ntfyTitle, ntfyMessage;
-              
-              // 生成 NTFY 标题（使用 RFC 2047 编码支持中文）
-              if (!ntfyTitleTemplate || ntfyTitleTemplate === '[VRC-Notifier] {changeType}: {friendName}') {
-                ntfyTitle = generateGotifyTitle(
-                  change.friend.display_name,
-                  change.changeType,
-                  change.oldStatus,
-                  change.newStatus,
-                  change.oldWorld,
-                  change.newWorld
-                );
-              } else {
-                const templateVars = {
-                  friendName: change.friend.display_name,
-                  changeType: change.changeType,
-                  oldStatus: change.oldStatus || '未知',
-                  newStatus: change.newStatus || '未知',
-                  oldWorld: change.oldWorld || '-',
-                  newWorld: change.newWorld || '-',
-                  oldStatusDescription: change.oldStatusDescription || '无',
-                  newStatusDescription: change.newStatusDescription || '无',
-                  timestamp: ntfyTimestamp,
-                  ntfyTimestamp: ntfyTimestamp
-                };
-                ntfyTitle = renderGotifyTemplate(ntfyTitleTemplate, templateVars);
-              }
-
-              // 生成 NTFY 消息
-              if (!ntfyMessageTemplate || ntfyMessageTemplate.includes('{friendName}')) {
-                ntfyMessage = generateGotifyMessage(
-                  change.friend.display_name,
-                  change.changeType,
-                  change.oldStatus,
-                  change.newStatus,
-                  change.oldWorld,
-                  change.newWorld,
-                  ntfyTimestamp,
-                  change.oldStatusDescription,
-                  change.newStatusDescription
-                );
-              } else {
-                const templateVars = {
-                  friendName: change.friend.display_name,
-                  changeType: change.changeType,
-                  oldStatus: change.oldStatus || '未知',
-                  newStatus: change.newStatus || '未知',
-                  oldWorld: change.oldWorld || '-',
-                  newWorld: change.newWorld || '-',
-                  oldStatusDescription: change.oldStatusDescription || '无',
-                  newStatusDescription: change.newStatusDescription || '无',
-                  timestamp: ntfyTimestamp,
-                  ntfyTimestamp: ntfyTimestamp
-                };
-                ntfyMessage = renderGotifyTemplate(ntfyMessageTemplate, templateVars);
-              }
-              
-              await sendNtfyNotification(user, ntfyTitle, ntfyMessage, user.ntfy_priority || 3, null);
-            }
-
-            // 发送通用 Webhook 推送（单个世界变化）
-            await sendWebhookNotification(user, {
-              friendName: change.friend.display_name,
-              oldStatus: change.oldStatus,
-              newStatus: change.newStatus,
-              oldWorld: change.oldWorld,
-              newWorld: change.newWorld,
-              changeType: change.changeType,
-              oldStatusDescription: change.oldStatusDescription,
-              newStatusDescription: change.newStatusDescription,
-              timestamp: timestamp,
-              avatarUrl: change.friend.avatar_url,
-              eventType: 'world_change'
-            });
-          } else {
-            // 多个世界变化，批量发送（与邮件逻辑一致，轮询完一圈后批量发送）
-            console.log(`[邮件通知] 有 ${buffer.changes.length} 个世界变化，批量发送`);
-            await sendBatchEmailNotification(user, buffer.changes);
-
-            // 发送批量 Gotify 推送（智能标题显示批量信息）
-            const timestamp = new Date().toLocaleString('zh-CN');
-            // NTFY 使用横杠格式时间，避免被识别为电话号码
-            const ntfyTimestamp = formatDateSafe(new Date());
-
-            // 批量标题 - 简洁明了显示批量变化（英文避免 NTFY HTTP Header 问题）
-            const batchTitle = `${buffer.changes.length} friends switched worlds`;
-
-            // 批量消息内容 - 使用Markdown格式清晰展示
-            let batchMessage = `**共有 ${buffer.changes.length} 位好友切换了世界**\n\n`;
-            buffer.changes.forEach((change, index) => {
-              const oldWorldShort = truncateString(change.oldWorld && change.oldWorld !== '-' ? change.oldWorld : '未知', 20);
-              const newWorldShort = truncateString(change.newWorld && change.newWorld !== '-' ? change.newWorld : '未知', 20);
-              batchMessage += `${index + 1}. **${change.friend.display_name}**\n`;
-              batchMessage += `   ${oldWorldShort} → ${newWorldShort}\n\n`;
-            });
-            batchMessage += ` ${timestamp}`;
-
-            // NTFY 批量消息使用横杠格式时间
-            let ntfyBatchMessage = `**共有 ${buffer.changes.length} 位好友切换了世界**\n\n`;
-            buffer.changes.forEach((change, index) => {
-              const oldWorldShort = truncateString(change.oldWorld && change.oldWorld !== '-' ? change.oldWorld : '未知', 20);
-              const newWorldShort = truncateString(change.newWorld && change.newWorld !== '-' ? change.newWorld : '未知', 20);
-              ntfyBatchMessage += `${index + 1}. **${change.friend.display_name}**\n`;
-              ntfyBatchMessage += `   ${oldWorldShort} → ${newWorldShort}\n\n`;
-            });
-            ntfyBatchMessage += ` ${ntfyTimestamp}`;
-
-            const extras = {
-              'client::display': {
-                'contentType': 'text/markdown'
-              }
-            };
-
-            await sendGotifyNotification(user, batchTitle, batchMessage, user.gotify_priority || 5, extras);
-
-            // 发送批量 NTFY 推送（使用 NTFY 自己的模板或默认批量消息）
-            if (user.ntfy_enabled) {
-              const ntfyTitleTemplate = user.ntfy_title_template;
-              const ntfyMessageTemplate = user.ntfy_message_template;
-              let ntfyTitle, ntfyMessage;
-              
-              // 批量通知通常使用默认格式，因为涉及多个好友
-              if (!ntfyTitleTemplate || ntfyTitleTemplate === '[VRC-Notifier] {changeType}: {friendName}') {
-                ntfyTitle = batchTitle;
-              } else {
-                // 如果用户设置了自定义模板，使用第一个好友的信息作为代表
-                const firstChange = buffer.changes[0];
-                const templateVars = {
-                  friendName: firstChange.friend.display_name,
-                  changeType: '批量世界变化',
-                  oldStatus: firstChange.oldStatus || '未知',
-                  newStatus: firstChange.newStatus || '未知',
-                  oldWorld: firstChange.oldWorld || '-',
-                  newWorld: firstChange.newWorld || '-',
-                  oldStatusDescription: firstChange.oldStatusDescription || '无',
-                  newStatusDescription: firstChange.newStatusDescription || '无',
-                  timestamp: ntfyTimestamp,
-                  ntfyTimestamp: ntfyTimestamp
-                };
-                ntfyTitle = renderGotifyTemplate(ntfyTitleTemplate, templateVars);
-              }
-
-              // 批量消息通常使用默认格式
-              if (!ntfyMessageTemplate || ntfyMessageTemplate.includes('{friendName}')) {
-                ntfyMessage = ntfyBatchMessage;
-              } else {
-                // 如果用户设置了自定义模板，使用第一个好友的信息作为代表
-                const firstChange = buffer.changes[0];
-                const templateVars = {
-                  friendName: firstChange.friend.display_name,
-                  changeType: '批量世界变化',
-                  oldStatus: firstChange.oldStatus || '未知',
-                  newStatus: firstChange.newStatus || '未知',
-                  oldWorld: firstChange.oldWorld || '-',
-                  newWorld: firstChange.newWorld || '-',
-                  oldStatusDescription: firstChange.oldStatusDescription || '无',
-                  newStatusDescription: firstChange.newStatusDescription || '无',
-                  timestamp: ntfyTimestamp,
-                  ntfyTimestamp: ntfyTimestamp
-                };
-                ntfyMessage = renderGotifyTemplate(ntfyMessageTemplate, templateVars);
-              }
-              
-              await sendNtfyNotification(user, ntfyTitle, ntfyMessage, user.ntfy_priority || 3, null);
-            }
-            
-            // 发送批量通用 Webhook 推送
-            for (const change of buffer.changes) {
-              await sendWebhookNotification(user, {
-                friendName: change.friend.display_name,
-                oldStatus: change.oldStatus,
-                newStatus: change.newStatus,
-                oldWorld: change.oldWorld,
-                newWorld: change.newWorld,
-                changeType: change.changeType,
-                oldStatusDescription: change.oldStatusDescription,
-                newStatusDescription: change.newStatusDescription,
-                timestamp: timestamp,
-                avatarUrl: change.friend.avatar_url,
-                eventType: 'world_change'
-              });
-            }
-          }
-          // 清空缓存
-          buffer.changes = [];
-        }
-      }
-    }
-
-
-  } catch (e) {
-    console.error('检查好友状态失败:', e.message);
-  }
-}
-
-// 定时任务：检查所有有监控好友的用户
-async function runMonitorTask() {
-  // 重置限流保护状态（检查是否需要重置计数）
-  resetRateLimitProtection();
-
-  // 如果监控已完全停止，跳过本次检查
-  if (globalRateLimitProtection.isStopped) {
-    console.log(`[${formatLocalTime()}] 监控已完全停止（限流保护），跳过本次检查`);
-    return;
-  }
-
-  // 如果处于暂停状态，跳过本次检查
-  if (globalRateLimitProtection.isPaused) {
-    const remaining = Math.ceil((globalRateLimitProtection.pauseEndTime - Date.now()) / 1000);
-    if (remaining > 0) {
-      console.log(`[${formatLocalTime()}] 系统处于限流暂停状态，剩余 ${remaining} 秒，跳过本次检查`);
-      return;
-    } else {
-      // 暂停结束，恢复检查
-      globalRateLimitProtection.isPaused = false;
-      console.log(`[${formatLocalTime()}] 限流暂停结束，恢复正常监控`);
-    }
-  }
-
-  // 查询所有有监控好友的用户（只要有一个好友被监控就检查）
-  const users = await new Promise((resolve, reject) => {
-    db.all(`
-      SELECT DISTINCT u.* FROM users u
-      INNER JOIN friend_monitor_config fmc ON u.id = fmc.user_id
-      WHERE fmc.monitor_enabled = 1
-    `, [], (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
-  });
-
-  if (users.length === 0) {
-    return;
-  }
-
-  for (const user of users) {
-    await checkFriendStatus(user);
-  }
-}
-
-// 7.1 cron 轮询已移除:改用 ws 事件驱动(见 ws pipeline 集成)。
-// runMonitorTask/checkFriendStatus 保留为死代码,不再被调用;其内部防抖/worldPollIndex/worldChangeBuffer 不执行。
 
 // ==================== API 路由 ====================
 
@@ -3541,7 +1979,7 @@ app.post('/api/settings', async (req, res) => {
     // 加密 SMTP 密码（如果提供了密码）
     let encryptedSmtpPass = null;
     if (smtpPass && smtpPass.trim() !== '') {
-      encryptedSmtpPass = encrypt(smtpPass.trim());
+      encryptedSmtpPass = smtpPass.trim();
       console.log(`[设置] SMTP密码已加密保存`);
     }
 
@@ -4310,7 +2748,7 @@ app.post('/api/test-email', async (req, res) => {
     }
 
     // 解密 SMTP 密码
-    const decryptedPass = decrypt(user.smtp_pass);
+    const decryptedPass = user.smtp_pass;
     if (!decryptedPass) {
       return res.json({ code: -1, msg: 'SMTP 密码解密失败' });
     }
@@ -4373,99 +2811,6 @@ app.post('/api/test-email', async (req, res) => {
   }
 });
 
-// 访问密钥验证 API
-app.post('/api/verify-access-key', async (req, res) => {
-  const { accessKey } = req.body;
-  
-  try {
-    const enabled = await isAccessKeyEnabled();
-    if (!enabled) {
-      return res.json({ code: 0, msg: '访问密钥验证已禁用', data: { required: false } });
-    }
-
-    const storedKey = await new Promise((resolve, reject) => {
-      db.get('SELECT value FROM system_settings WHERE key = ?', ['access_key'], (err, row) => {
-        if (err) reject(err);
-        else resolve(row ? row.value : null);
-      });
-    });
-
-    if (!storedKey) {
-      return res.json({ code: -1, msg: '访问密钥未配置' });
-    }
-
-    if (accessKey === storedKey) {
-      return res.json({ code: 0, msg: '验证成功', data: { required: true } });
-    } else {
-      return res.json({ code: -1, msg: '访问密钥错误' });
-    }
-  } catch (err) {
-    console.error('验证访问密钥失败:', err);
-    return res.json({ code: -1, msg: '验证失败' });
-  }
-});
-
-// 获取访问密钥状态
-app.get('/api/access-key-status', async (req, res) => {
-  try {
-    const enabled = await isAccessKeyEnabled();
-    const accessKey = await new Promise((resolve, reject) => {
-      db.get('SELECT value FROM system_settings WHERE key = ?', ['access_key'], (err, row) => {
-        if (err) reject(err);
-        else resolve(row ? row.value : null);
-      });
-    });
-    
-    return res.json({ 
-      code: 0, 
-      data: { 
-        enabled, 
-        accessKey: accessKey || '' 
-      } 
-    });
-  } catch (err) {
-    console.error('获取访问密钥状态失败:', err);
-    return res.json({ code: -1, msg: '获取失败' });
-  }
-});
-
-// 更新访问密钥设置
-app.post('/api/access-key-settings', async (req, res) => {
-  const { enabled, accessKey } = req.body;
-  
-  try {
-    // 更新启用状态
-    await new Promise((resolve, reject) => {
-      db.run(
-        'INSERT INTO system_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-        ['access_key_enabled', enabled ? '1' : '0'],
-        (err) => {
-          if (err) reject(err);
-          else resolve();
-        }
-      );
-    });
-
-    // 如果提供了新密钥，更新密钥
-    if (accessKey) {
-      await new Promise((resolve, reject) => {
-        db.run(
-          'INSERT INTO system_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-          ['access_key', accessKey],
-          (err) => {
-            if (err) reject(err);
-            else resolve();
-          }
-        );
-      });
-    }
-
-    return res.json({ code: 0, msg: '设置已保存' });
-  } catch (err) {
-    console.error('保存访问密钥设置失败:', err);
-    return res.json({ code: -1, msg: '保存失败' });
-  }
-});
 
 // SSE客户端连接管理
 const sseClients = new Map(); // Map<userId, res>
@@ -4588,7 +2933,7 @@ async function sendRateLimitNotificationToAllUsers(apiType, status, pauseSeconds
             secure: user.smtp_secure === 1,
             auth: {
               user: user.smtp_user,
-              pass: decrypt(user.smtp_pass)
+              pass: user.smtp_pass
             }
           });
 
@@ -4733,7 +3078,7 @@ async function sendSessionExpiredNotificationToAllPlatforms(userId, reason = 'un
           secure: user.smtp_secure === 1,
           auth: {
             user: user.smtp_user,
-            pass: decrypt(user.smtp_pass)
+            pass: user.smtp_pass
           }
         });
 
@@ -4930,19 +3275,51 @@ async function fetchWorldName(session, worldId, userId) {
   return null;
 }
 
-// 4 渠道通知(复用现有函数,默认智能模板)
+// 4 渠道通知(复用现有函数 + 用户自定义模板,#5)
 async function sendFriendNotification(user, friend, params) {
   const { oldStatus, newStatus, oldWorld, newWorld, changeType, oldStatusDescription, newStatusDescription, oldPlatform, newPlatform } = params;
   await sendEmailNotification(user, { friend, oldStatus, newStatus, oldWorld, newWorld, changeType, oldStatusDescription, newStatusDescription, oldPlatform, newPlatform });
   const timestamp = new Date().toLocaleString('zh-CN');
-  const gotifyTitle = generateGotifyTitle(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld);
-  const gotifyMessage = generateGotifyMessage(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld, timestamp, oldStatusDescription, newStatusDescription);
+  const ntfyTimestamp = formatDateSafe(new Date());
+  const templateVars = {
+    friendName: friend.display_name, changeType,
+    oldStatus: oldStatus || '未知', newStatus: newStatus || '未知',
+    oldWorld: oldWorld || '-', newWorld: newWorld || '-',
+    oldStatusDescription: oldStatusDescription || '无', newStatusDescription: newStatusDescription || '无',
+    timestamp,
+    oldPlatform: getPlatformDisplayName(oldPlatform || 'unknown'), newPlatform: getPlatformDisplayName(newPlatform || 'unknown')
+  };
+  // Gotify 标题(用户自定义模板 vs 默认智能标题)
+  let gotifyTitle;
+  if (!user.gotify_title_template || user.gotify_title_template === '[VRC-Notifier] {changeType}: {friendName}') {
+    gotifyTitle = generateGotifyTitle(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld);
+  } else {
+    gotifyTitle = renderGotifyTemplate(user.gotify_title_template, templateVars);
+  }
+  // Gotify 消息
+  let gotifyMessage;
+  if (!user.gotify_message_template || user.gotify_message_template.includes('{friendName}')) {
+    gotifyMessage = generateGotifyMessage(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld, timestamp, oldStatusDescription, newStatusDescription);
+  } else {
+    gotifyMessage = renderGotifyTemplate(user.gotify_message_template, templateVars);
+  }
   const extras = { 'client::display': { 'contentType': 'text/markdown' } };
   await sendGotifyNotification(user, gotifyTitle, gotifyMessage, user.gotify_priority || 5, extras);
+  // NTFY(用户自定义模板 vs 默认)
   if (user.ntfy_enabled) {
-    const ntfyTimestamp = formatDateSafe(new Date());
-    const ntfyTitle = generateGotifyTitle(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld);
-    const ntfyMessage = generateGotifyMessage(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld, ntfyTimestamp, oldStatusDescription, newStatusDescription);
+    const ntfyTemplateVars = { ...templateVars, timestamp: ntfyTimestamp, ntfyTimestamp };
+    let ntfyTitle;
+    if (!user.ntfy_title_template || user.ntfy_title_template === '[VRC-Notifier] {changeType}: {friendName}') {
+      ntfyTitle = generateGotifyTitle(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld);
+    } else {
+      ntfyTitle = renderGotifyTemplate(user.ntfy_title_template, ntfyTemplateVars);
+    }
+    let ntfyMessage;
+    if (!user.ntfy_message_template || user.ntfy_message_template.includes('{friendName}')) {
+      ntfyMessage = generateGotifyMessage(friend.display_name, changeType, oldStatus, newStatus, oldWorld, newWorld, ntfyTimestamp, oldStatusDescription, newStatusDescription);
+    } else {
+      ntfyMessage = renderGotifyTemplate(user.ntfy_message_template, ntfyTemplateVars);
+    }
     await sendNtfyNotification(user, ntfyTitle, ntfyMessage, user.ntfy_priority || 3, null);
   }
   const eventType = oldStatus === 'offline' ? 'friend_online' : (newStatus === 'offline' ? 'friend_offline' : 'status_change');
@@ -5052,17 +3429,21 @@ async function handlePipelineEvent(userId, raw, parsed) {
   if (!user || user.monitor_enabled === 0) return; // 6.5 用户级监控关
   try {
     switch (type) {
-      case 'friend-online':
+      case 'friend-online': {
+        // #3 查 worldName(上线通知世界名准确)
+        const session = userSessions.get(user.vrchat_user_id);
+        const worldName = (session && content.worldId) ? await fetchWorldName(session, content.worldId, user.vrchat_user_id) : null;
         await applyFriendChange(user, content.userId, {
           state: 'online', status: content.user?.status, location: content.location, worldId: content.worldId,
-          platform: content.platform, statusDescription: content.user?.statusDescription,
+          worldName, platform: content.platform, statusDescription: content.user?.statusDescription,
           displayName: content.user?.displayName, avatarUrl: content.user?.currentAvatarImageUrl
         });
         break;
+      }
       case 'friend-active':
         await applyFriendChange(user, content.userId, {
           state: 'active', status: content.user?.status || 'active', location: 'offline', worldId: null,
-          platform: content.platform || 'web', statusDescription: content.user?.statusDescription,
+          platform: content.platform, statusDescription: content.user?.statusDescription,
           displayName: content.user?.displayName, avatarUrl: content.user?.currentAvatarImageUrl
         });
         break;
@@ -5124,15 +3505,10 @@ async function restoreAllPipelineConnections() {
 
 // 启动服务器
 async function startServer() {
-  // 初始化访问密钥
-  const accessKey = await initAccessKey();
-  const enabled = await isAccessKeyEnabled();
-  
   app.listen(PORT, () => {
     console.log('================================================');
     console.log('VRC-Notifier 服务已启动');
     console.log('访问地址: http://localhost:' + PORT);
-    console.log('访问密钥: ' + (enabled ? '已启用 (' + accessKey + ')' : '已禁用'));
     console.log('邮件通知: 已启用');
     console.log('监控模式: WebSocket 实时事件驱动(cron 轮询已停用)');
     console.log('API限流保护: 已启用(对账路用,ws 事件驱动不限流)');
