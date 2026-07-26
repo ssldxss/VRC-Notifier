@@ -27,22 +27,25 @@ const wsConnections = new Map();
  */
 function createPipelineManager(opts) {
     const { getSession, deleteSession, onGameLogin, onMessage, userAgent, log } = opts;
-    const logger = log || ((msg) => console.log(msg));
+    const logger = log || ((msg) => console.log(`[${new Date().toISOString()}] ${msg}`));
+    const processingChains = new Map(); // #2 per-user 事件处理串行队列(避免并发竞态)
 
     // 2.2 用 session.api 调 GET /auth 换 pipeline token
-    // 成功返回 token;401/异常返回 null(调用方判定 session 失效)
+    // 返回 {status, token}:status = 'ok'(有 token)/ 'error'(任何失败,含 401/网络错,5s 重试不清会话)
+    // 默认 cookies 不失效:不判 session 失效,失败一律重试
     async function getPipelineToken(userId) {
         const session = getSession(userId);
-        if (!session || !session.api) return null;
+        if (!session || !session.api) return { status: 'error' };
         try {
             const res = await session.api.get('/auth');
+            logger(`[ws] GET /auth userId=${userId} status=${res.status} body=${JSON.stringify(res.data).slice(0, 300)}`);
             if (res.status !== 200 || !res.data || !res.data.token) {
-                return null;
+                return { status: 'error' };
             }
-            return res.data.token;
+            return { status: 'ok', token: res.data.token };
         } catch (e) {
-            logger(`[ws] getPipelineToken 失败 userId=${userId}: ${e.message}`);
-            return null;
+            logger(`[ws] GET /auth 网络错误 userId=${userId}: ${e.message}`);
+            return { status: 'error' };
         }
     }
 
@@ -54,15 +57,19 @@ function createPipelineManager(opts) {
             return;
         }
 
-        // 换 token(2.2);失败 = session 失效(2.6)
-        const token = await getPipelineToken(userId);
-        if (!token) {
-            logger(`[ws] 换 token 失败 userId=${userId},判定 session 失效,触发游戏登录检测`);
-            onGameLogin(userId, displayName);
-            deleteSession(userId);
-            wsConnections.delete(userId);
-            return; // 不重连
+        // 换 token(2.2);失败一律 5s 重试,不判 session 失效(默认 cookies 不失效)
+        const result = await getPipelineToken(userId);
+        if (result.status !== 'ok') {
+            logger(`[ws] 换 token 失败 userId=${userId},5s 后重试(不清会话,不触发游戏登录)`);
+            if (existing && existing.stopped) return;
+            setTimeout(() => {
+                if (getSession(userId) && !(wsConnections.get(userId)?.stopped)) {
+                    connectPipeline(userId, displayName);
+                }
+            }, RECONNECT_DELAY_MS);
+            return;
         }
+        const token = result.token;
 
         const ws = new WebSocket(`${PIPELINE_WS_BASE}/?auth=${token}`, {
             headers: { 'User-Agent': userAgent }
@@ -95,6 +102,7 @@ function createPipelineManager(opts) {
 
         ws.on('message', (data) => {
             const raw = data.toString();
+            logger(`[ws] 收到消息 userId=${userId} raw=${raw.slice(0, 500)}`);
             // 2.7 消息去重:与上一帧原始字符串比对
             if (raw === conn.lastMessage) return;
             conn.lastMessage = raw;
@@ -111,7 +119,12 @@ function createPipelineManager(opts) {
                 return;
             }
             // 事件处理回调(第 3 组实现)
-            if (onMessage) onMessage(userId, raw, parsed);
+            if (!onMessage) return;
+            // #2 per-user 串行:事件按序处理,避免同一好友多事件并发竞态
+            const prev = processingChains.get(userId) || Promise.resolve();
+            processingChains.set(userId, prev
+                .then(() => onMessage(userId, raw, parsed))
+                .catch((e) => logger(`[ws] onMessage 错误 userId=${userId}: ${e.message}`)));
         });
 
         ws.on('close', () => {

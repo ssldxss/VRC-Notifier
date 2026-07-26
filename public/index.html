@@ -2742,6 +2742,18 @@
 
     // 检查访问密钥状态
     async function checkAccessKeyStatus() {
+      // 访问密钥已去掉(后端删了端点):直接隐藏卡片,显示主面板/登录
+      accessKeyCard.classList.add('hidden');
+      if (currentUserId) {
+        showMainPanel();
+        loadUserInfo();
+        loadFriendsFromCache();
+        loadSettings();
+        loadHistory();
+      } else {
+        loginCard.classList.remove('hidden');
+      }
+      return;
       try {
         const res = await fetch(`${API_BASE}/access-key-status`);
         const data = await res.json();
