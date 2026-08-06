@@ -1,3 +1,9 @@
+# 也是给我改废了还是再搓一个吧(
+
+
+
+
+
 <h1 align="center">VRC-Notifier</h1>
 
 <p align="center"><strong>VRChat 好友状态监控与通知工具</strong></p>
